@@ -8,7 +8,6 @@ on:
     # 1D candle close + 5 minute buffer
     - cron: "5 0 * * *"
 
-  # Manual testing
   workflow_dispatch:
     inputs:
       timeframe:
@@ -36,6 +35,14 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Restore duplicate protection state
+        uses: actions/cache/restore@v4
+        with:
+          path: state.json
+          key: ema-alert-state-${{ github.run_id }}
+          restore-keys: |
+            ema-alert-state-
+
       - name: Run Binance EMA Scanner
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
@@ -56,3 +63,9 @@ jobs:
           echo "Running Binance EMA Scanner: $TIMEFRAME"
 
           python scanner.py "$TIMEFRAME"
+
+      - name: Save duplicate protection state
+        uses: actions/cache/save@v4
+        with:
+          path: state.json
+          key: ema-alert-state-${{ github.run_id }}
