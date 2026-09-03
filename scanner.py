@@ -1,7 +1,9 @@
 import os
 import sys
+import json
 import requests
 import pandas as pd
+
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
@@ -11,8 +13,29 @@ BINANCE_API = "https://data-api.binance.vision"
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
+STATE_FILE = "state.json"
+
 MAX_WORKERS = 10
 KLINE_LIMIT = 210
+
+
+def load_state():
+    if not os.path.exists(STATE_FILE):
+        return set()
+
+    try:
+        with open(STATE_FILE, "r") as file:
+            data = json.load(file)
+
+        return set(data)
+
+    except Exception:
+        return set()
+
+
+def save_state(state):
+    with open(STATE_FILE, "w") as file:
+        json.dump(sorted(state), file, indent=2)
 
 
 def get_usdt_pairs():
@@ -133,10 +156,7 @@ def calculate_signals(symbol, interval):
 
     signals = []
 
-    # ==================================================
     # 1. EMA 50 crosses ABOVE EMA 200
-    # ==================================================
-
     if (
         previous["ema50"] <= previous["ema200"]
         and current["ema50"] > current["ema200"]
@@ -145,13 +165,8 @@ def calculate_signals(symbol, interval):
             "🟢 EMA 50 crossed ABOVE EMA 200"
         )
 
-    # ==================================================
     # 2. EMA 50 crosses BELOW EMA 200
-    #
     # 1D ONLY
-    # 4H bearish alert disabled
-    # ==================================================
-
     elif (
         interval == "1d"
         and previous["ema50"] >= previous["ema200"]
@@ -161,10 +176,7 @@ def calculate_signals(symbol, interval):
             "🔴 EMA 50 crossed BELOW EMA 200"
         )
 
-    # ==================================================
     # 3. Price crosses ABOVE EMA 50
-    # ==================================================
-
     if (
         previous["close"] <= previous["ema50"]
         and current["close"] > current["ema50"]
@@ -173,13 +185,8 @@ def calculate_signals(symbol, interval):
             "🟢 Price crossed ABOVE EMA 50"
         )
 
-    # ==================================================
     # 4. Price crosses BELOW EMA 50
-    #
     # 1D ONLY
-    # 4H bearish alert disabled
-    # ==================================================
-
     elif (
         interval == "1d"
         and previous["close"] >= previous["ema50"]
@@ -189,10 +196,7 @@ def calculate_signals(symbol, interval):
             "🔴 Price crossed BELOW EMA 50"
         )
 
-    # ==================================================
     # 5. Price crosses ABOVE EMA 200
-    # ==================================================
-
     if (
         previous["close"] <= previous["ema200"]
         and current["close"] > current["ema200"]
@@ -201,13 +205,8 @@ def calculate_signals(symbol, interval):
             "🟢 Price crossed ABOVE EMA 200"
         )
 
-    # ==================================================
     # 6. Price crosses BELOW EMA 200
-    #
     # 1D ONLY
-    # 4H bearish alert disabled
-    # ==================================================
-
     elif (
         interval == "1d"
         and previous["close"] >= previous["ema200"]
@@ -227,7 +226,7 @@ def calculate_signals(symbol, interval):
         "ema50": current["ema50"],
         "ema200": current["ema200"],
         "signals": signals,
-        "candle_time": current["close_time"],
+        "candle_time": int(current["close_time"]),
     }
 
 
@@ -280,9 +279,30 @@ def format_message(result):
     )
 
 
+def make_signal_id(result):
+    """
+    Unique ID for this exact symbol + timeframe
+    + candle + signal.
+    """
+
+    return "|".join([
+        result["symbol"],
+        result["interval"],
+        str(result["candle_time"]),
+        "|".join(result["signals"]),
+    ])
+
+
 def scan(interval):
     print(
         f"\n🔎 Scanning {interval}...",
+        flush=True
+    )
+
+    state = load_state()
+
+    print(
+        f"🛡️ Stored alerts: {len(state)}",
         flush=True
     )
 
@@ -296,7 +316,6 @@ def scan(interval):
     results = []
     completed = 0
 
-    # Parallel Binance requests
     with ThreadPoolExecutor(
         max_workers=MAX_WORKERS
     ) as executor:
@@ -344,13 +363,29 @@ def scan(interval):
         flush=True
     )
 
-    # Send Telegram alerts
+    new_alerts = 0
+
     for result in results:
+
+        signal_id = make_signal_id(result)
+
+        # Duplicate protection
+        if signal_id in state:
+            print(
+                f"⏭️ Duplicate skipped: "
+                f"{result['symbol']} "
+                f"{interval}",
+                flush=True
+            )
+            continue
 
         try:
             message = format_message(result)
 
             send_telegram(message)
+
+            state.add(signal_id)
+            new_alerts += 1
 
             print(
                 f"📨 Alert sent: "
@@ -367,6 +402,18 @@ def scan(interval):
                 f"{error}",
                 flush=True
             )
+
+    save_state(state)
+
+    print(
+        f"🛡️ New alerts sent: {new_alerts}",
+        flush=True
+    )
+
+    print(
+        f"💾 State saved: {len(state)} records",
+        flush=True
+    )
 
 
 if __name__ == "__main__":
