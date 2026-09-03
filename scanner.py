@@ -21,7 +21,7 @@ KLINE_LIMIT = 210
 IST = ZoneInfo("Asia/Kolkata")
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+TELEGRAM_CHAT_IDS = os.environ.get("TELEGRAM_CHAT_IDS", "").split(",")
 
 # Manual test mode:
 # true  = resend already-alerted signals
@@ -134,7 +134,7 @@ def get_klines(symbol, interval):
 # =========================================================
 
 def send_telegram(message):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_IDS:
         print("❌ Telegram credentials missing.")
         return False
 
@@ -143,32 +143,45 @@ def send_telegram(message):
         f"{TELEGRAM_TOKEN}/sendMessage"
     )
 
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "disable_web_page_preview": True
-    }
+    all_sent = True
 
-    try:
-        response = requests.post(
-            url,
-            json=payload,
-            timeout=20
-        )
+    for chat_id in TELEGRAM_CHAT_IDS:
+        chat_id = chat_id.strip()
 
-        if response.ok:
-            return True
+        if not chat_id:
+            continue
 
-        print(
-            "Telegram error:",
-            response.status_code,
-            response.text
-        )
+        payload = {
+            "chat_id": chat_id,
+            "text": message,
+            "disable_web_page_preview": True
+        }
 
-    except Exception as e:
-        print("Telegram request failed:", e)
+        try:
+            response = requests.post(
+                url,
+                json=payload,
+                timeout=20
+            )
 
-    return False
+            if response.ok:
+                print(f"✅ Telegram sent to {chat_id}")
+            else:
+                print(
+                    f"❌ Telegram error for {chat_id}:",
+                    response.status_code,
+                    response.text
+                )
+                all_sent = False
+
+        except Exception as e:
+            print(
+                f"❌ Telegram request failed for {chat_id}:",
+                e
+            )
+            all_sent = False
+
+    return all_sent
 
 
 # =========================================================
