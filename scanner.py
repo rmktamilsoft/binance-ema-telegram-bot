@@ -11,15 +11,33 @@ TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
 def get_usdt_pairs():
     url = f"{BINANCE_API}/api/v3/exchangeInfo"
-    data = requests.get(url, timeout=20).json()
+
+    response = requests.get(
+        url,
+        timeout=30,
+        headers={
+            "User-Agent": "Mozilla/5.0"
+        }
+    )
+
+    response.raise_for_status()
+
+    data = response.json()
+
+    # Helpful error message if Binance returns
+    # an unexpected response
+    if "symbols" not in data:
+        raise RuntimeError(
+            f"Binance API returned unexpected response: {data}"
+        )
 
     symbols = []
 
     for s in data["symbols"]:
         if (
-            s["quoteAsset"] == "USDT"
-            and s["status"] == "TRADING"
-            and s["isSpotTradingAllowed"]
+            s.get("quoteAsset") == "USDT"
+            and s.get("status") == "TRADING"
+            and s.get("isSpotTradingAllowed", False)
         ):
             symbols.append(s["symbol"])
 
