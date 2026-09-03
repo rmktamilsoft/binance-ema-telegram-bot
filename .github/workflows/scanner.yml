@@ -2,10 +2,10 @@ name: Binance EMA Scanner
 
 on:
   schedule:
-    # 4H candle close + 5 minute buffer
+    # 4H candle closes
     - cron: "5 0,4,8,12,16,20 * * *"
 
-    # 1D candle close + 5 minute buffer
+    # 1D candle closes
     - cron: "5 0 * * *"
 
   workflow_dispatch:
@@ -19,21 +19,50 @@ on:
           - "4h"
           - "1d"
 
+      test_mode:
+        description: "Bypass duplicate protection for manual testing"
+        required: true
+        default: false
+        type: boolean
+
+
 jobs:
   scan:
+
     runs-on: ubuntu-latest
 
     steps:
+
+      # ===================================================
+      # CHECKOUT
+      # ===================================================
+
       - name: Checkout repository
         uses: actions/checkout@v4
+
+
+      # ===================================================
+      # PYTHON
+      # ===================================================
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
+
+      # ===================================================
+      # DEPENDENCIES
+      # ===================================================
+
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          pip install -r requirements.txt
+
+
+      # ===================================================
+      # RESTORE STATE
+      # ===================================================
 
       - name: Restore duplicate protection state
         uses: actions/cache/restore@v4
@@ -43,26 +72,51 @@ jobs:
           restore-keys: |
             ema-alert-state-
 
+
+      # ===================================================
+      # RUN SCANNER
+      # ===================================================
+
       - name: Run Binance EMA Scanner
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TEST_MODE: ${{ inputs.test_mode }}
+
         run: |
+
           if [ "${{ github.event_name }}" = "schedule" ]; then
 
             if [ "${{ github.event.schedule }}" = "5 0 * * *" ]; then
+
               TIMEFRAME="1d"
+
             else
+
               TIMEFRAME="4h"
+
             fi
 
+            TEST_MODE="false"
+
           else
+
             TIMEFRAME="${{ inputs.timeframe }}"
+
           fi
 
-          echo "Running Binance EMA Scanner: $TIMEFRAME"
+          echo "======================================"
+          echo "Binance EMA Scanner"
+          echo "Timeframe: $TIMEFRAME"
+          echo "Test Mode: $TEST_MODE"
+          echo "======================================"
 
           python scanner.py "$TIMEFRAME"
+
+
+      # ===================================================
+      # SAVE STATE
+      # ===================================================
 
       - name: Save duplicate protection state
         uses: actions/cache/save@v4
