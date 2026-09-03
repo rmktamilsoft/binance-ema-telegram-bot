@@ -3,7 +3,7 @@ import requests
 import pandas as pd
 from datetime import datetime, timezone
 
-BINANCE_API = "https://api.binance.com"
+BINANCE_API = "https://data-api.binance.vision"
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
