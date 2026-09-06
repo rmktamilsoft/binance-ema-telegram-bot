@@ -106,7 +106,8 @@ jobs:
           fi
 
           echo "======================================"
-          echo "Binance EMA Scanner"
+          echo "Binance USDⓈ-M Futures EMA Scanner"
+          echo "Market: USDT Perpetual Futures"
           echo "Timeframe: $TIMEFRAME"
           echo "Test Mode: $TEST_MODE"
           echo "======================================"
