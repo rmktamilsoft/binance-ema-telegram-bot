@@ -812,11 +812,61 @@ def format_message(
     )
 
     lines.append(
-        f"https://www.binance.com/en/futures/"
-        f"{symbol}"
+        f"https://www.binance.com/en/futures/{symbol}"
     )
 
     return "\n".join(lines)
+
+
+# =========================================================
+# SUMMARY HELPERS
+# =========================================================
+
+def get_signal_direction(result):
+
+    has_bullish = any(
+        "🟢" in signal
+        for signal in result["signals"]
+    )
+
+    has_bearish = any(
+        "🔴" in signal
+        for signal in result["signals"]
+    )
+
+    if has_bullish and has_bearish:
+        return "mixed"
+
+    if has_bullish:
+        return "bullish"
+
+    if has_bearish:
+        return "bearish"
+
+    return "neutral"
+
+
+def format_coin_list(coins, max_coins=30):
+
+    if not coins:
+        return "None"
+
+    unique_coins = list(
+        dict.fromkeys(coins)
+    )
+
+    visible = unique_coins[:max_coins]
+
+    text = " • ".join(visible)
+
+    remaining = (
+        len(unique_coins) - len(visible)
+    )
+
+    if remaining > 0:
+        text += f" • +{remaining} more"
+
+    return text
 
 
 # =========================================================
@@ -826,7 +876,7 @@ def format_message(
 def send_summary(
     results,
     interval,
-    new_alert_count
+    new_alerts
 ):
 
     if not results:
@@ -838,23 +888,41 @@ def send_summary(
         else "1D"
     )
 
-    bullish_count = 0
-    bearish_count = 0
+    bullish_coins = []
+    bearish_coins = []
     strong_coins = []
+
+    # -----------------------------------------------------
+    # All signal results
+    # -----------------------------------------------------
 
     for result in results:
 
-        if any(
-            "🟢" in signal
-            for signal in result["signals"]
-        ):
-            bullish_count += 1
+        direction = get_signal_direction(
+            result
+        )
 
-        if any(
-            "🔴" in signal
-            for signal in result["signals"]
-        ):
-            bearish_count += 1
+        if direction == "bullish":
+            bullish_coins.append(
+                result["symbol"]
+            )
+
+        elif direction == "bearish":
+            bearish_coins.append(
+                result["symbol"]
+            )
+
+        elif direction == "mixed":
+            # If a result somehow contains both
+            # bullish and bearish signals,
+            # show it in both sections.
+            bullish_coins.append(
+                result["symbol"]
+            )
+
+            bearish_coins.append(
+                result["symbol"]
+            )
 
         if (
             "STRONG"
@@ -863,6 +931,39 @@ def send_summary(
             strong_coins.append(
                 result["symbol"]
             )
+
+    # -----------------------------------------------------
+    # Actually sent alerts
+    # -----------------------------------------------------
+
+    new_bullish_coins = []
+    new_bearish_coins = []
+    new_mixed_coins = []
+
+    for result in new_alerts:
+
+        direction = get_signal_direction(
+            result
+        )
+
+        if direction == "bullish":
+            new_bullish_coins.append(
+                result["symbol"]
+            )
+
+        elif direction == "bearish":
+            new_bearish_coins.append(
+                result["symbol"]
+            )
+
+        elif direction == "mixed":
+            new_mixed_coins.append(
+                result["symbol"]
+            )
+
+    # -----------------------------------------------------
+    # Build summary
+    # -----------------------------------------------------
 
     lines = []
 
@@ -878,20 +979,75 @@ def send_summary(
         f"{len(results)}"
     )
 
+    lines.append("")
+
+    lines.append(
+        f"🟢 Bullish ({len(bullish_coins)}):"
+    )
+
+    lines.append(
+        format_coin_list(
+            bullish_coins
+        )
+    )
+
+    lines.append("")
+
+    lines.append(
+        f"🔴 Bearish ({len(bearish_coins)}):"
+    )
+
+    lines.append(
+        format_coin_list(
+            bearish_coins
+        )
+    )
+
+    lines.append("")
+
     lines.append(
         f"🆕 New alerts sent: "
-        f"{new_alert_count}"
+        f"{len(new_alerts)}"
     )
 
-    lines.append(
-        f"🟢 Bullish signals: "
-        f"{bullish_count}"
-    )
+    if new_alerts:
 
-    lines.append(
-        f"🔴 Bearish signals: "
-        f"{bearish_count}"
-    )
+        if new_bullish_coins:
+
+            lines.append(
+                "🟢 "
+                + format_coin_list(
+                    new_bullish_coins
+                )
+            )
+
+        if new_bearish_coins:
+
+            lines.append(
+                "🔴 "
+                + format_coin_list(
+                    new_bearish_coins
+                )
+            )
+
+        if new_mixed_coins:
+
+            lines.append(
+                "⚪ "
+                + format_coin_list(
+                    new_mixed_coins
+                )
+            )
+
+    else:
+
+        lines.append(
+            "No new alerts."
+        )
+
+    # -----------------------------------------------------
+    # Strong signals
+    # -----------------------------------------------------
 
     if strong_coins:
 
@@ -901,11 +1057,12 @@ def send_summary(
             "🔥 STRONG SIGNALS:"
         )
 
-        for coin in strong_coins[:20]:
-
-            lines.append(
-                f"• {coin}"
+        lines.append(
+            format_coin_list(
+                strong_coins,
+                max_coins=20
             )
+        )
 
     send_telegram(
         "\n".join(lines)
@@ -1022,7 +1179,11 @@ def scan(interval):
         f"{len(results)}"
     )
 
-    new_alert_count = 0
+    # -----------------------------------------------------
+    # Store ONLY alerts successfully sent
+    # -----------------------------------------------------
+
+    new_alerts = []
 
     # -----------------------------------------------------
     # Process alerts
@@ -1075,7 +1236,9 @@ def scan(interval):
 
         if sent:
 
-            new_alert_count += 1
+            new_alerts.append(
+                result
+            )
 
             # Keep state updated
             if signal_id not in alerts:
@@ -1109,7 +1272,7 @@ def scan(interval):
         send_summary(
             results,
             interval,
-            new_alert_count
+            new_alerts
         )
 
     # -----------------------------------------------------
@@ -1135,7 +1298,7 @@ def scan(interval):
 
     print(
         f"📨 New alerts sent: "
-        f"{new_alert_count}"
+        f"{len(new_alerts)}"
     )
 
     print("=" * 60)
