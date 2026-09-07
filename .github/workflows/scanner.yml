@@ -25,66 +25,44 @@ on:
         default: false
         type: boolean
 
+
 jobs:
   scan:
+
     runs-on: ubuntu-latest
 
     steps:
-      # ==========================================
+
+      # ===================================================
       # CHECKOUT
-      # ==========================================
+      # ===================================================
 
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ==========================================
+
+      # ===================================================
       # PYTHON
-      # ==========================================
+      # ===================================================
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      # ==========================================
+
+      # ===================================================
       # DEPENDENCIES
-      # ==========================================
+      # ===================================================
 
       - name: Install dependencies
         run: |
           pip install -r requirements.txt
 
-      # ==========================================
-      # CHECK RUNNER NETWORK
-      # ==========================================
 
-      - name: Check Runner Network
-        run: |
-          echo "======================================"
-          echo "GitHub Runner Public IP"
-          echo "======================================"
-
-          curl -s https://api.ipify.org
-          echo
-
-          echo "======================================"
-          echo "IP Location / ISP"
-          echo "======================================"
-
-          curl -s https://ipinfo.io/json
-          echo
-
-          echo "======================================"
-          echo "Binance Futures API Test"
-          echo "======================================"
-
-          curl -i --max-time 20 \
-            "https://fapi.binance.com/fapi/v1/exchangeInfo" \
-            | head -30
-
-      # ==========================================
-      # RESTORE DUPLICATE PROTECTION STATE
-      # ==========================================
+      # ===================================================
+      # RESTORE STATE
+      # ===================================================
 
       - name: Restore duplicate protection state
         uses: actions/cache/restore@v4
@@ -94,9 +72,10 @@ jobs:
           restore-keys: |
             ema-alert-state-
 
-      # ==========================================
+
+      # ===================================================
       # RUN SCANNER
-      # ==========================================
+      # ===================================================
 
       - name: Run Binance EMA Scanner
         env:
@@ -105,12 +84,17 @@ jobs:
           TEST_MODE: ${{ inputs.test_mode }}
 
         run: |
+
           if [ "${{ github.event_name }}" = "schedule" ]; then
 
             if [ "${{ github.event.schedule }}" = "5 0 * * *" ]; then
+
               TIMEFRAME="1d"
+
             else
+
               TIMEFRAME="4h"
+
             fi
 
             TEST_MODE="false"
@@ -130,9 +114,10 @@ jobs:
 
           python scanner.py "$TIMEFRAME"
 
-      # ==========================================
+
+      # ===================================================
       # SAVE STATE
-      # ==========================================
+      # ===================================================
 
       - name: Save duplicate protection state
         uses: actions/cache/save@v4
