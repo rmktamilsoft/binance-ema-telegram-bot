@@ -9,1077 +9,1624 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
-
 # =========================================================
+
 # CONFIG
+
 # =========================================================
 
 STATE_FILE = "state.json"
+
 MAX_WORKERS = 10
-KLINE_LIMIT = 210
+
+# Binance maximum candles returned per API request
+
+BINANCE_KLINE_PAGE_SIZE = 1000
+
+# Small pause between historical pages
+
+KLINE_PAGE_SLEEP = 0.05
 
 IST = ZoneInfo("Asia/Kolkata")
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_IDS = os.environ.get("TELEGRAM_CHAT_IDS", "").split(",")
+TELEGRAM_CHAT_IDS = os.environ.get(
+"TELEGRAM_CHAT_IDS",
+""
+).split(",")
 
 # Manual test mode:
-# true  = resend already-alerted signals
-# false = normal duplicate protection
-TEST_MODE = os.environ.get("TEST_MODE", "false").lower() == "true"
 
+# true  = resend already-alerted signals
+
+# false = normal duplicate protection
+
+TEST_MODE = (
+os.environ.get("TEST_MODE", "false").lower() == "true"
+)
 
 # =========================================================
+
 # STATE
+
 # =========================================================
 
 def load_state():
-    if not os.path.exists(STATE_FILE):
+
+```
+if not os.path.exists(STATE_FILE):
+    return {
+        "alerts": [],
+        "alerted_symbols": []
+    }
+
+try:
+
+    with open(
+        STATE_FILE,
+        "r",
+        encoding="utf-8"
+    ) as f:
+
+        state = json.load(f)
+
+    # Backward compatibility if old state was just a list
+    if isinstance(state, list):
         return {
-            "alerts": [],
+            "alerts": state,
             "alerted_symbols": []
         }
 
-    try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            state = json.load(f)
+    return {
+        "alerts": state.get(
+            "alerts",
+            []
+        ),
+        "alerted_symbols": state.get(
+            "alerted_symbols",
+            []
+        )
+    }
 
-        # Backward compatibility if old state was just a list
-        if isinstance(state, list):
-            return {
-                "alerts": state,
-                "alerted_symbols": []
-            }
+except Exception:
 
-        return {
-            "alerts": state.get("alerts", []),
-            "alerted_symbols": state.get("alerted_symbols", [])
-        }
-
-    except Exception:
-        return {
-            "alerts": [],
-            "alerted_symbols": []
-        }
-
+    return {
+        "alerts": [],
+        "alerted_symbols": []
+    }
+```
 
 def save_state(state):
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=2)
 
+```
+with open(
+    STATE_FILE,
+    "w",
+    encoding="utf-8"
+) as f:
+
+    json.dump(
+        state,
+        f,
+        indent=2
+    )
+```
 
 # =========================================================
+
 # BINANCE API
+
 # =========================================================
 
 def binance_get(url, params=None):
-    for attempt in range(3):
-        try:
-            response = requests.get(
-                url,
-                params=params,
-                timeout=20
+
+```
+for attempt in range(3):
+
+    try:
+
+        response = requests.get(
+            url,
+            params=params,
+            timeout=30
+        )
+
+        response.raise_for_status()
+
+        return response.json()
+
+    except Exception as e:
+
+        print(
+            f"Binance request failed "
+            f"(attempt {attempt + 1}/3): {e}"
+        )
+
+        if attempt < 2:
+
+            time.sleep(
+                2 ** (attempt + 1)
             )
 
-            response.raise_for_status()
-            return response.json()
+return None
+```
 
-        except Exception as e:
-            print(
-                f"Binance request failed "
-                f"(attempt {attempt + 1}/3): {e}"
-            )
+# =========================================================
 
-            if attempt < 2:
-                time.sleep(2 ** (attempt + 1))
+# BINANCE SYMBOLS
 
-    return None
-
+# =========================================================
 
 def get_usdt_pairs():
-    url = "https://data-api.binance.vision/api/v3/exchangeInfo"
 
-    data = binance_get(url)
+```
+url = (
+    "https://data-api.binance.vision/"
+    "api/v3/exchangeInfo"
+)
 
-    if not data:
-        return []
+data = binance_get(url)
 
-    symbols = []
+if not data:
+    return []
 
-    for item in data.get("symbols", []):
-        if (
-            item.get("quoteAsset") == "USDT"
-            and item.get("status") == "TRADING"
-            and item.get("isSpotTradingAllowed") is True
-        ):
-            symbols.append(item["symbol"])
+symbols = []
 
-    return sorted(symbols)
+for item in data.get(
+    "symbols",
+    []
+):
 
+    if (
+        item.get("quoteAsset") == "USDT"
+        and item.get("status") == "TRADING"
+        and item.get("isSpotTradingAllowed") is True
+    ):
+
+        symbols.append(
+            item["symbol"]
+        )
+
+return sorted(symbols)
+```
+
+# =========================================================
+
+# FULL HISTORICAL KLINES
+
+# =========================================================
 
 def get_klines(symbol, interval):
-    url = "https://data-api.binance.vision/api/v3/klines"
+
+```
+"""
+Download ALL available Binance historical candles.
+
+Binance returns a maximum of 1000 candles per request,
+so we paginate from the oldest available candle toward
+the newest candle.
+
+Result:
+    Oldest candle -> newest candle
+"""
+
+url = (
+    "https://data-api.binance.vision/"
+    "api/v3/klines"
+)
+
+all_klines = []
+
+# -----------------------------------------------------
+# Start from the beginning of Binance history.
+#
+# Binance accepts startTime in milliseconds.
+# 0 means Unix epoch and lets Binance return the
+# earliest available candle for the symbol.
+# -----------------------------------------------------
+
+start_time = 0
+
+while True:
 
     params = {
         "symbol": symbol,
         "interval": interval,
-        "limit": KLINE_LIMIT
+        "limit": BINANCE_KLINE_PAGE_SIZE,
+        "startTime": start_time
     }
 
-    return binance_get(url, params)
+    klines = binance_get(
+        url,
+        params
+    )
 
+    if not klines:
+        break
+
+    all_klines.extend(
+        klines
+    )
+
+    # -------------------------------------------------
+    # If fewer than 1000 candles were returned,
+    # we reached the end of available history.
+    # -------------------------------------------------
+
+    if len(klines) < BINANCE_KLINE_PAGE_SIZE:
+        break
+
+    # -------------------------------------------------
+    # Continue after the last candle returned.
+    #
+    # Open time is used because it is unique per
+    # symbol + interval.
+    # -------------------------------------------------
+
+    last_open_time = klines[-1][0]
+
+    next_start_time = (
+        last_open_time + 1
+    )
+
+    # Safety check against an unexpected API loop
+    if next_start_time <= start_time:
+        break
+
+    start_time = next_start_time
+
+    if KLINE_PAGE_SLEEP > 0:
+        time.sleep(
+            KLINE_PAGE_SLEEP
+        )
+
+if not all_klines:
+    return None
+
+# -----------------------------------------------------
+# Remove duplicate candles.
+#
+# Binance pagination should not normally duplicate,
+# but this protects the EMA calculation.
+# -----------------------------------------------------
+
+unique = {}
+
+for candle in all_klines:
+
+    open_time = candle[0]
+
+    unique[open_time] = candle
+
+all_klines = [
+    unique[key]
+    for key in sorted(unique)
+]
+
+print(
+    f"📚 {symbol} {interval}: "
+    f"{len(all_klines)} historical candles loaded"
+)
+
+return all_klines
+```
 
 # =========================================================
+
 # TELEGRAM
+
 # =========================================================
 
 def send_telegram(message):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_IDS:
-        print("❌ Telegram credentials missing.")
-        return False
 
-    url = (
-        f"https://api.telegram.org/bot"
-        f"{TELEGRAM_TOKEN}/sendMessage"
+```
+if (
+    not TELEGRAM_TOKEN
+    or not TELEGRAM_CHAT_IDS
+):
+
+    print(
+        "❌ Telegram credentials missing."
     )
 
-    all_sent = True
+    return False
 
-    for chat_id in TELEGRAM_CHAT_IDS:
-        chat_id = chat_id.strip()
+url = (
+    f"https://api.telegram.org/bot"
+    f"{TELEGRAM_TOKEN}/sendMessage"
+)
 
-        if not chat_id:
-            continue
+all_sent = True
 
-        payload = {
-            "chat_id": chat_id,
-            "text": message,
-            "disable_web_page_preview": True
-        }
+for chat_id in TELEGRAM_CHAT_IDS:
 
-        try:
-            response = requests.post(
-                url,
-                json=payload,
-                timeout=20
-            )
+    chat_id = chat_id.strip()
 
-            if response.ok:
-                print(f"✅ Telegram sent to {chat_id}")
-            else:
-                print(
-                    f"❌ Telegram error for {chat_id}:",
-                    response.status_code,
-                    response.text
-                )
-                all_sent = False
+    if not chat_id:
+        continue
 
-        except Exception as e:
+    payload = {
+        "chat_id": chat_id,
+        "text": message,
+        "disable_web_page_preview": True
+    }
+
+    try:
+
+        response = requests.post(
+            url,
+            json=payload,
+            timeout=20
+        )
+
+        if response.ok:
+
             print(
-                f"❌ Telegram request failed for {chat_id}:",
-                e
+                f"✅ Telegram sent to {chat_id}"
             )
+
+        else:
+
+            print(
+                f"❌ Telegram error for {chat_id}:",
+                response.status_code,
+                response.text
+            )
+
             all_sent = False
 
-    return all_sent
+    except Exception as e:
 
+        print(
+            f"❌ Telegram request failed "
+            f"for {chat_id}:",
+            e
+        )
+
+        all_sent = False
+
+return all_sent
+```
 
 # =========================================================
+
 # DATA ANALYSIS
+
 # =========================================================
 
 def prepare_dataframe(klines):
-    if not klines:
-        return None
 
-    columns = [
+```
+if not klines:
+    return None
+
+columns = [
+    "open_time",
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "close_time",
+    "quote_volume",
+    "trades",
+    "taker_buy_base",
+    "taker_buy_quote",
+    "ignore"
+]
+
+df = pd.DataFrame(
+    klines,
+    columns=columns
+)
+
+numeric_columns = [
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume"
+]
+
+for col in numeric_columns:
+
+    df[col] = pd.to_numeric(
+        df[col],
+        errors="coerce"
+    )
+
+df["open_time"] = pd.to_datetime(
+    df["open_time"],
+    unit="ms",
+    utc=True
+)
+
+df["close_time"] = pd.to_datetime(
+    df["close_time"],
+    unit="ms",
+    utc=True
+)
+
+# -----------------------------------------------------
+# Remove invalid rows
+# -----------------------------------------------------
+
+df = df.dropna(
+    subset=[
         "open_time",
-        "open",
-        "high",
-        "low",
-        "close",
-        "volume",
         "close_time",
-        "quote_volume",
-        "trades",
-        "taker_buy_base",
-        "taker_buy_quote",
-        "ignore"
+        "close"
     ]
+)
 
-    df = pd.DataFrame(klines, columns=columns)
+# -----------------------------------------------------
+# Sort oldest -> newest
+# -----------------------------------------------------
 
-    numeric_columns = [
-        "open",
-        "high",
-        "low",
-        "close",
-        "volume"
+df = df.sort_values(
+    "open_time"
+)
+
+# -----------------------------------------------------
+# Remove duplicate candles
+# -----------------------------------------------------
+
+df = df.drop_duplicates(
+    subset=["open_time"],
+    keep="last"
+)
+
+# -----------------------------------------------------
+# Remove current forming candle
+#
+# Only CLOSED candles are allowed in EMA signal logic.
+# -----------------------------------------------------
+
+now = pd.Timestamp.now(
+    tz="UTC"
+)
+
+df = df[
+    df["close_time"] < now
+].copy()
+
+if len(df) < 205:
+    return None
+
+# -----------------------------------------------------
+# FULL-HISTORY EMA
+#
+# IMPORTANT:
+# EMA is calculated only AFTER loading all historical
+# candles.
+#
+# This avoids calculating EMA200 from only the latest
+# 210 / 1000 / 1500 candles.
+# -----------------------------------------------------
+
+df["ema50"] = df["close"].ewm(
+    span=50,
+    adjust=False,
+    min_periods=50
+).mean()
+
+df["ema200"] = df["close"].ewm(
+    span=200,
+    adjust=False,
+    min_periods=200
+).mean()
+
+# -----------------------------------------------------
+# Remove rows where EMA is not ready
+# -----------------------------------------------------
+
+df = df.dropna(
+    subset=[
+        "ema50",
+        "ema200"
     ]
+).copy()
 
-    for col in numeric_columns:
-        df[col] = pd.to_numeric(
-            df[col],
-            errors="coerce"
-        )
+if len(df) < 2:
+    return None
 
-    df["open_time"] = pd.to_datetime(
-        df["open_time"],
-        unit="ms",
-        utc=True
-    )
-
-    df["close_time"] = pd.to_datetime(
-        df["close_time"],
-        unit="ms",
-        utc=True
-    )
-
-    # -----------------------------------------------------
-    # Remove current forming candle
-    # -----------------------------------------------------
-
-    now = pd.Timestamp.now(tz="UTC")
-
-    df = df[df["close_time"] < now].copy()
-
-    if len(df) < 205:
-        return None
-
-    df["ema50"] = df["close"].ewm(
-        span=50,
-        adjust=False
-    ).mean()
-
-    df["ema200"] = df["close"].ewm(
-        span=200,
-        adjust=False
-    ).mean()
-
-    return df
-
+return df
+```
 
 # =========================================================
+
 # TREND
-# =========================================================
-
-def get_trend(close, ema50, ema200):
-
-    if close > ema50 > ema200:
-        return "STRONG BULLISH"
-
-    if close > ema50 and ema50 <= ema200:
-        return "BULLISH / TRANSITION"
-
-    if close < ema50 < ema200:
-        return "STRONG BEARISH"
-
-    if close < ema50 and ema50 >= ema200:
-        return "BEARISH / TRANSITION"
-
-    return "NEUTRAL"
-
 
 # =========================================================
+
+def get_trend(
+close,
+ema50,
+ema200
+):
+
+```
+if close > ema50 > ema200:
+    return "STRONG BULLISH"
+
+if (
+    close > ema50
+    and ema50 <= ema200
+):
+    return "BULLISH / TRANSITION"
+
+if close < ema50 < ema200:
+    return "STRONG BEARISH"
+
+if (
+    close < ema50
+    and ema50 >= ema200
+):
+    return "BEARISH / TRANSITION"
+
+return "NEUTRAL"
+```
+
+# =========================================================
+
 # SIGNAL DETECTION
+
 # =========================================================
 
-def analyze_symbol(symbol, interval):
+def analyze_symbol(
+symbol,
+interval
+):
 
-    klines = get_klines(symbol, interval)
+```
+klines = get_klines(
+    symbol,
+    interval
+)
 
-    if not klines:
-        return None
+if not klines:
+    return None
 
-    df = prepare_dataframe(klines)
+df = prepare_dataframe(
+    klines
+)
 
-    if df is None or len(df) < 205:
-        return None
+if df is None or len(df) < 2:
+    return None
 
-    previous = df.iloc[-2]
-    current = df.iloc[-1]
+# -----------------------------------------------------
+# IMPORTANT:
+#
+# df contains CLOSED candles only.
+#
+# previous = previous CLOSED candle
+# current  = latest CLOSED candle
+#
+# This prevents forming-candle signals.
+# -----------------------------------------------------
 
-    prev_close = float(previous["close"])
-    close = float(current["close"])
+previous = df.iloc[-2]
+current = df.iloc[-1]
 
-    prev_ema50 = float(previous["ema50"])
-    ema50 = float(current["ema50"])
+prev_close = float(
+    previous["close"]
+)
 
-    prev_ema200 = float(previous["ema200"])
-    ema200 = float(current["ema200"])
+close = float(
+    current["close"]
+)
 
-    signals = []
+prev_ema50 = float(
+    previous["ema50"]
+)
 
-    # -----------------------------------------------------
-    # EMA 50 crosses ABOVE EMA 200
-    # -----------------------------------------------------
+ema50 = float(
+    current["ema50"]
+)
 
-    if (
-        prev_ema50 <= prev_ema200
-        and ema50 > ema200
-    ):
-        signals.append(
-            "EMA 50 crossed ABOVE EMA 200 🟢"
-        )
+prev_ema200 = float(
+    previous["ema200"]
+)
 
-    # -----------------------------------------------------
-    # EMA 50 crosses BELOW EMA 200
-    # Only allowed on 1D
-    # -----------------------------------------------------
+ema200 = float(
+    current["ema200"]
+)
 
-    if interval == "1d":
-        if (
-            prev_ema50 >= prev_ema200
-            and ema50 < ema200
-        ):
-            signals.append(
-                "EMA 50 crossed BELOW EMA 200 🔴"
-            )
+signals = []
 
-    # -----------------------------------------------------
-    # Price crosses ABOVE EMA 50
-    # -----------------------------------------------------
+# =====================================================
+# EMA 50 CROSSES ABOVE EMA 200
+# =====================================================
 
-    if (
-        prev_close <= prev_ema50
-        and close > ema50
-    ):
-        signals.append(
-            "Price crossed ABOVE EMA 50 🟢"
-        )
+if (
+    prev_ema50 <= prev_ema200
+    and ema50 > ema200
+):
 
-    # -----------------------------------------------------
-    # Price crosses BELOW EMA 50
-    # Only allowed on 1D
-    # -----------------------------------------------------
-
-    if interval == "1d":
-        if (
-            prev_close >= prev_ema50
-            and close < ema50
-        ):
-            signals.append(
-                "Price crossed BELOW EMA 50 🔴"
-            )
-
-    # -----------------------------------------------------
-    # Price crosses ABOVE EMA 200
-    # -----------------------------------------------------
-
-    if (
-        prev_close <= prev_ema200
-        and close > ema200
-    ):
-        signals.append(
-            "Price crossed ABOVE EMA 200 🟢"
-        )
-
-    # -----------------------------------------------------
-    # Price crosses BELOW EMA 200
-    # Only allowed on 1D
-    # -----------------------------------------------------
-
-    if interval == "1d":
-        if (
-            prev_close >= prev_ema200
-            and close < ema200
-        ):
-            signals.append(
-                "Price crossed BELOW EMA 200 🔴"
-            )
-
-    if not signals:
-        return None
-
-    trend = get_trend(
-        close,
-        ema50,
-        ema200
+    signals.append(
+        "EMA 50 crossed ABOVE EMA 200 🟢"
     )
 
-    return {
-        "symbol": symbol,
-        "interval": interval,
-        "signals": signals,
-        "trend": trend,
-        "close": close,
-        "ema50": ema50,
-        "ema200": ema200,
-        "candle_time": current["close_time"]
-    }
+# =====================================================
+# EMA 50 CROSSES BELOW EMA 200
+# ONLY 1D
+# =====================================================
 
+if interval == "1d":
+
+    if (
+        prev_ema50 >= prev_ema200
+        and ema50 < ema200
+    ):
+
+        signals.append(
+            "EMA 50 crossed BELOW EMA 200 🔴"
+        )
+
+# =====================================================
+# PRICE CROSSES ABOVE EMA 50
+# =====================================================
+
+if (
+    prev_close <= prev_ema50
+    and close > ema50
+):
+
+    signals.append(
+        "Price crossed ABOVE EMA 50 🟢"
+    )
+
+# =====================================================
+# PRICE CROSSES BELOW EMA 50
+# ONLY 1D
+# =====================================================
+
+if interval == "1d":
+
+    if (
+        prev_close >= prev_ema50
+        and close < ema50
+    ):
+
+        signals.append(
+            "Price crossed BELOW EMA 50 🔴"
+        )
+
+# =====================================================
+# PRICE CROSSES ABOVE EMA 200
+#
+# STRICT CROSS:
+#
+# Previous CLOSED candle must be at/below EMA200
+# AND
+# Latest CLOSED candle must be above EMA200.
+# =====================================================
+
+if (
+    prev_close <= prev_ema200
+    and close > ema200
+):
+
+    signals.append(
+        "Price crossed ABOVE EMA 200 🟢"
+    )
+
+# =====================================================
+# PRICE CROSSES BELOW EMA 200
+# ONLY 1D
+# =====================================================
+
+if interval == "1d":
+
+    if (
+        prev_close >= prev_ema200
+        and close < ema200
+    ):
+
+        signals.append(
+            "Price crossed BELOW EMA 200 🔴"
+        )
+
+# =====================================================
+# No signal
+# =====================================================
+
+if not signals:
+    return None
+
+trend = get_trend(
+    close,
+    ema50,
+    ema200
+)
+
+return {
+    "symbol": symbol,
+    "interval": interval,
+    "signals": signals,
+    "trend": trend,
+    "close": close,
+    "ema50": ema50,
+    "ema200": ema200,
+    "candle_time": current["close_time"]
+}
+```
 
 # =========================================================
+
 # SIGNAL STRENGTH
+
 # =========================================================
 
 def get_signal_strength(result):
 
-    signals = result["signals"]
-    trend = result["trend"]
+```
+signals = result["signals"]
+trend = result["trend"]
 
-    if len(signals) >= 2:
-        return "🔥 STRONG SIGNAL"
+if len(signals) >= 2:
+    return "🔥 STRONG SIGNAL"
 
-    if (
-        any("EMA 50 crossed" in s for s in signals)
-        and any(
-            "Price crossed ABOVE EMA 50" in s
-            or "Price crossed BELOW EMA 50" in s
-            or "Price crossed ABOVE EMA 200" in s
-            or "Price crossed BELOW EMA 200" in s
-            for s in signals
-        )
-    ):
-        return "🔥 STRONG SIGNAL"
+if (
+    any(
+        "EMA 50 crossed" in s
+        for s in signals
+    )
+    and any(
+        "Price crossed ABOVE EMA 50" in s
+        or "Price crossed BELOW EMA 50" in s
+        or "Price crossed ABOVE EMA 200" in s
+        or "Price crossed BELOW EMA 200" in s
+        for s in signals
+    )
+):
 
-    if "BULLISH" in trend:
-        return "🟢 BULLISH SIGNAL"
+    return "🔥 STRONG SIGNAL"
 
-    if "BEARISH" in trend:
-        return "🔴 BEARISH SIGNAL"
+if "BULLISH" in trend:
+    return "🟢 BULLISH SIGNAL"
 
-    return "⚠️ SIGNAL"
+if "BEARISH" in trend:
+    return "🔴 BEARISH SIGNAL"
 
+return "⚠️ SIGNAL"
+```
 
 # =========================================================
+
 # TIME FORMAT
+
 # =========================================================
 
 def format_times(timestamp):
 
-    if timestamp.tzinfo is None:
-        timestamp = timestamp.replace(
-            tzinfo=timezone.utc
-        )
+```
+if timestamp.tzinfo is None:
 
-    utc_time = timestamp.astimezone(timezone.utc)
-    ist_time = timestamp.astimezone(IST)
-
-    return (
-        utc_time.strftime("%Y-%m-%d %H:%M:%S UTC"),
-        ist_time.strftime("%Y-%m-%d %H:%M:%S IST")
+    timestamp = timestamp.replace(
+        tzinfo=timezone.utc
     )
 
+utc_time = timestamp.astimezone(
+    timezone.utc
+)
+
+ist_time = timestamp.astimezone(
+    IST
+)
+
+return (
+    utc_time.strftime(
+        "%Y-%m-%d %H:%M:%S UTC"
+    ),
+    ist_time.strftime(
+        "%Y-%m-%d %H:%M:%S IST"
+    )
+)
+```
 
 # =========================================================
+
 # SIGNAL ID
+
 # =========================================================
 
 def make_signal_id(result):
 
-    candle_time = result["candle_time"].isoformat()
+```
+candle_time = (
+    result["candle_time"].isoformat()
+)
 
-    signal_text = "|".join(
-        result["signals"]
-    )
+signal_text = "|".join(
+    result["signals"]
+)
 
-    return (
-        f"{result['symbol']}|"
-        f"{result['interval']}|"
-        f"{candle_time}|"
-        f"{signal_text}"
-    )
-
+return (
+    f"{result['symbol']}|"
+    f"{result['interval']}|"
+    f"{candle_time}|"
+    f"{signal_text}"
+)
+```
 
 # =========================================================
+
 # MULTI TIMEFRAME
-# =========================================================
-
-def get_mtf_confirmation(symbol, current_interval):
-
-    other_interval = (
-        "1d"
-        if current_interval == "4h"
-        else "4h"
-    )
-
-    klines = get_klines(
-        symbol,
-        other_interval
-    )
-
-    if not klines:
-        return None
-
-    df = prepare_dataframe(klines)
-
-    if df is None:
-        return None
-
-    current = df.iloc[-1]
-
-    close = float(current["close"])
-    ema50 = float(current["ema50"])
-    ema200 = float(current["ema200"])
-
-    trend = get_trend(
-        close,
-        ema50,
-        ema200
-    )
-
-    return {
-        "interval": other_interval,
-        "trend": trend,
-        "close": close,
-        "ema50": ema50,
-        "ema200": ema200
-    }
-
 
 # =========================================================
+
+def get_mtf_confirmation(
+symbol,
+current_interval
+):
+
+```
+other_interval = (
+    "1d"
+    if current_interval == "4h"
+    else "4h"
+)
+
+klines = get_klines(
+    symbol,
+    other_interval
+)
+
+if not klines:
+    return None
+
+df = prepare_dataframe(
+    klines
+)
+
+if df is None:
+    return None
+
+current = df.iloc[-1]
+
+close = float(
+    current["close"]
+)
+
+ema50 = float(
+    current["ema50"]
+)
+
+ema200 = float(
+    current["ema200"]
+)
+
+trend = get_trend(
+    close,
+    ema50,
+    ema200
+)
+
+return {
+    "interval": other_interval,
+    "trend": trend,
+    "close": close,
+    "ema50": ema50,
+    "ema200": ema200
+}
+```
+
+# =========================================================
+
 # MESSAGE
+
 # =========================================================
 
 def format_message(
-    result,
-    previously_alerted=False,
-    mtf=None
+result,
+previously_alerted=False,
+mtf=None
 ):
 
-    symbol = result["symbol"]
-    interval = result["interval"]
+```
+symbol = result["symbol"]
+interval = result["interval"]
 
-    close = result["close"]
-    ema50 = result["ema50"]
-    ema200 = result["ema200"]
+close = result["close"]
+ema50 = result["ema50"]
+ema200 = result["ema200"]
 
-    signals = result["signals"]
-    trend = result["trend"]
+signals = result["signals"]
+trend = result["trend"]
 
-    strength = get_signal_strength(result)
+strength = get_signal_strength(
+    result
+)
 
-    utc_time, ist_time = format_times(
-        result["candle_time"]
+utc_time, ist_time = format_times(
+    result["candle_time"]
+)
+
+distance_50 = (
+    (close - ema50)
+    / ema50
+) * 100
+
+distance_200 = (
+    (close - ema200)
+    / ema200
+) * 100
+
+if interval == "4h":
+    timeframe_text = "4H"
+else:
+    timeframe_text = "1D"
+
+lines = []
+
+lines.append(
+    "🚨 BINANCE EMA ALERT"
+)
+
+lines.append("")
+
+lines.append(
+    f"🪙 Coin: {symbol}"
+)
+
+lines.append(
+    f"⏱ Timeframe: {timeframe_text}"
+)
+
+if previously_alerted:
+
+    lines.append("")
+
+    lines.append(
+        "🔁 PREVIOUSLY ALERTED COIN"
     )
 
-    distance_50 = (
-        (close - ema50) / ema50
-    ) * 100
+lines.append("")
 
-    distance_200 = (
-        (close - ema200) / ema200
-    ) * 100
+lines.append(
+    f"📊 Signal Strength: {strength}"
+)
 
-    if interval == "4h":
-        timeframe_text = "4H"
-    else:
-        timeframe_text = "1D"
+lines.append("")
 
-    lines = []
+lines.append(
+    "📢 SIGNALS:"
+)
 
-    lines.append("🚨 BINANCE EMA ALERT")
-    lines.append("")
-    lines.append(f"🪙 Coin: {symbol}")
-    lines.append(f"⏱ Timeframe: {timeframe_text}")
+for signal in signals:
 
-    if previously_alerted:
+    lines.append(
+        f"• {signal}"
+    )
+
+lines.append("")
+
+lines.append(
+    f"📈 Trend: {trend}"
+)
+
+lines.append("")
+
+lines.append(
+    "💰 PRICE / EMA"
+)
+
+lines.append(
+    f"Price: {close:.8f}"
+)
+
+lines.append(
+    f"EMA 50: {ema50:.8f}"
+)
+
+lines.append(
+    f"EMA 200: {ema200:.8f}"
+)
+
+lines.append("")
+
+lines.append(
+    f"📏 Price vs EMA 50: "
+    f"{distance_50:+.2f}%"
+)
+
+lines.append(
+    f"📏 Price vs EMA 200: "
+    f"{distance_200:+.2f}%"
+)
+
+# =====================================================
+# MTF
+# =====================================================
+
+if mtf:
+
+    if (
+        "BULLISH" in trend
+        and "BULLISH" in mtf["trend"]
+    ):
+
         lines.append("")
-        lines.append(
-            "🔁 PREVIOUSLY ALERTED COIN"
-        )
-
-    lines.append("")
-    lines.append(f"📊 Signal Strength: {strength}")
-    lines.append("")
-
-    lines.append("📢 SIGNALS:")
-
-    for signal in signals:
-        lines.append(f"• {signal}")
-
-    lines.append("")
-    lines.append(f"📈 Trend: {trend}")
-
-    lines.append("")
-    lines.append("💰 PRICE / EMA")
-    lines.append(
-        f"Price: {close:.8f}"
-    )
-    lines.append(
-        f"EMA 50: {ema50:.8f}"
-    )
-    lines.append(
-        f"EMA 200: {ema200:.8f}"
-    )
-
-    lines.append("")
-    lines.append(
-        f"📏 Price vs EMA 50: "
-        f"{distance_50:+.2f}%"
-    )
-
-    lines.append(
-        f"📏 Price vs EMA 200: "
-        f"{distance_200:+.2f}%"
-    )
-
-    # -----------------------------------------------------
-    # MTF
-    # -----------------------------------------------------
-
-    if mtf:
-
-        if (
-            "BULLISH" in trend
-            and "BULLISH" in mtf["trend"]
-        ):
-            lines.append("")
-            lines.append(
-                "🔥🔥 MULTI-TIMEFRAME "
-                "BULLISH CONFIRMATION"
-            )
-
-        elif (
-            "BEARISH" in trend
-            and "BEARISH" in mtf["trend"]
-        ):
-            lines.append("")
-            lines.append(
-                "🔴🔴 MULTI-TIMEFRAME "
-                "BEARISH CONFIRMATION"
-            )
-
-        else:
-            lines.append("")
-            lines.append(
-                "⚠️ MULTI-TIMEFRAME MIXED"
-            )
 
         lines.append(
-            f"{mtf['interval'].upper()} Trend: "
-            f"{mtf['trend']}"
+            "🔥🔥 MULTI-TIMEFRAME "
+            "BULLISH CONFIRMATION"
         )
 
-    lines.append("")
-    lines.append("🕯 CANDLE CLOSE")
-    lines.append(f"UTC: {utc_time}")
-    lines.append(f"IST: {ist_time}")
+    elif (
+        "BEARISH" in trend
+        and "BEARISH" in mtf["trend"]
+    ):
 
-    lines.append("")
+        lines.append("")
+
+        lines.append(
+            "🔴🔴 MULTI-TIMEFRAME "
+            "BEARISH CONFIRMATION"
+        )
+
+    else:
+
+        lines.append("")
+
+        lines.append(
+            "⚠️ MULTI-TIMEFRAME MIXED"
+        )
+
     lines.append(
-        "✅ CLOSED CANDLE — CONFIRMED"
+        f"{mtf['interval'].upper()} Trend: "
+        f"{mtf['trend']}"
     )
 
-    lines.append("")
-    lines.append(
-        f"🔗 Binance Chart: "
-        f"https://www.binance.com/en/trade/"
-        f"{symbol}?type=spot"
-    )
+lines.append("")
 
-    return "\n".join(lines)
+lines.append(
+    "🕯 CANDLE CLOSE"
+)
 
+lines.append(
+    f"UTC: {utc_time}"
+)
+
+lines.append(
+    f"IST: {ist_time}"
+)
+
+lines.append("")
+
+lines.append(
+    "✅ CLOSED CANDLE — CONFIRMED"
+)
+
+lines.append("")
+
+lines.append(
+    "🔗 Binance Chart: "
+    f"https://www.binance.com/en/trade/"
+    f"{symbol}?type=spot"
+)
+
+return "\n".join(lines)
+```
 
 # =========================================================
+
 # SUMMARY
+
 # =========================================================
 
 def send_summary(
-    results,
-    interval,
-    new_alert_symbols
+results,
+interval,
+new_alert_symbols
 ):
 
-    if not results:
-        return
+```
+if not results:
+    return
 
-    timeframe = (
-        "4H"
-        if interval == "4h"
-        else "1D"
-    )
+timeframe = (
+    "4H"
+    if interval == "4h"
+    else "1D"
+)
 
-    bullish_symbols = []
-    bearish_symbols = []
-    strong_coins = []
+bullish_symbols = []
+bearish_symbols = []
+strong_coins = []
 
-    for result in results:
+for result in results:
 
-        symbol = result["symbol"]
+    symbol = result["symbol"]
 
-        # -------------------------------------------------
-        # Bullish symbols
-        # -------------------------------------------------
-
-        if any(
-            "🟢" in signal
-            for signal in result["signals"]
-        ):
-            bullish_symbols.append(symbol)
-
-        # -------------------------------------------------
-        # Bearish symbols
-        # -------------------------------------------------
-
-        if any(
-            "🔴" in signal
-            for signal in result["signals"]
-        ):
-            bearish_symbols.append(symbol)
-
-        # -------------------------------------------------
-        # Strong signals
-        # -------------------------------------------------
-
-        if (
-            "STRONG" in
-            get_signal_strength(result)
-        ):
-            strong_coins.append(symbol)
-
-    # Remove duplicates while preserving order
-    new_alert_symbols = list(
-        dict.fromkeys(new_alert_symbols)
-    )
-
-    bullish_symbols = list(
-        dict.fromkeys(bullish_symbols)
-    )
-
-    bearish_symbols = list(
-        dict.fromkeys(bearish_symbols)
-    )
-
-    strong_coins = list(
-        dict.fromkeys(strong_coins)
-    )
-
-    lines = []
-
-    lines.append(
-        f"📋 BINANCE {timeframe} SCAN SUMMARY"
-    )
-
-    # -----------------------------------------------------
-    # Total signals
-    # -----------------------------------------------------
-
-    lines.append("")
-    lines.append(
-        f"🔎 Signals found: {len(results)}"
-    )
-
-    # -----------------------------------------------------
-    # New alerts
-    # -----------------------------------------------------
-
-    lines.append("")
-    lines.append(
-        f"🆕 New alerts sent: "
-        f"{len(new_alert_symbols)}"
-    )
-
-    if new_alert_symbols:
-        lines.append(
-            "• " +
-            " • ".join(new_alert_symbols)
-        )
-    else:
-        lines.append("• None")
-
-    # -----------------------------------------------------
+    # -------------------------------------------------
     # Bullish
-    # -----------------------------------------------------
+    # -------------------------------------------------
 
-    lines.append("")
-    lines.append(
-        f"🟢 Bullish signals: "
-        f"{len(bullish_symbols)}"
-    )
+    if any(
+        "🟢" in signal
+        for signal in result["signals"]
+    ):
 
-    if bullish_symbols:
-        lines.append(
-            "• " +
-            " • ".join(bullish_symbols)
+        bullish_symbols.append(
+            symbol
         )
-    else:
-        lines.append("• None")
 
-    # -----------------------------------------------------
+    # -------------------------------------------------
     # Bearish
-    # -----------------------------------------------------
+    # -------------------------------------------------
+
+    if any(
+        "🔴" in signal
+        for signal in result["signals"]
+    ):
+
+        bearish_symbols.append(
+            symbol
+        )
+
+    # -------------------------------------------------
+    # Strong
+    # -------------------------------------------------
+
+    if (
+        "STRONG"
+        in get_signal_strength(result)
+    ):
+
+        strong_coins.append(
+            symbol
+        )
+
+# -----------------------------------------------------
+# Remove duplicates
+# -----------------------------------------------------
+
+new_alert_symbols = list(
+    dict.fromkeys(
+        new_alert_symbols
+    )
+)
+
+bullish_symbols = list(
+    dict.fromkeys(
+        bullish_symbols
+    )
+)
+
+bearish_symbols = list(
+    dict.fromkeys(
+        bearish_symbols
+    )
+)
+
+strong_coins = list(
+    dict.fromkeys(
+        strong_coins
+    )
+)
+
+lines = []
+
+lines.append(
+    f"📋 BINANCE {timeframe} SCAN SUMMARY"
+)
+
+# -----------------------------------------------------
+# Total
+# -----------------------------------------------------
+
+lines.append("")
+
+lines.append(
+    f"🔎 Signals found: "
+    f"{len(results)}"
+)
+
+# -----------------------------------------------------
+# New alerts
+# -----------------------------------------------------
+
+lines.append("")
+
+lines.append(
+    f"🆕 New alerts sent: "
+    f"{len(new_alert_symbols)}"
+)
+
+if new_alert_symbols:
+
+    lines.append(
+        "• "
+        + " • ".join(
+            new_alert_symbols
+        )
+    )
+
+else:
+
+    lines.append(
+        "• None"
+    )
+
+# -----------------------------------------------------
+# Bullish
+# -----------------------------------------------------
+
+lines.append("")
+
+lines.append(
+    f"🟢 Bullish signals: "
+    f"{len(bullish_symbols)}"
+)
+
+if bullish_symbols:
+
+    lines.append(
+        "• "
+        + " • ".join(
+            bullish_symbols
+        )
+    )
+
+else:
+
+    lines.append(
+        "• None"
+    )
+
+# -----------------------------------------------------
+# Bearish
+# -----------------------------------------------------
+
+lines.append("")
+
+lines.append(
+    f"🔴 Bearish signals: "
+    f"{len(bearish_symbols)}"
+)
+
+if bearish_symbols:
+
+    lines.append(
+        "• "
+        + " • ".join(
+            bearish_symbols
+        )
+    )
+
+else:
+
+    lines.append(
+        "• None"
+    )
+
+# -----------------------------------------------------
+# Strong signals
+# -----------------------------------------------------
+
+if strong_coins:
 
     lines.append("")
+
     lines.append(
-        f"🔴 Bearish signals: "
-        f"{len(bearish_symbols)}"
+        "🔥 STRONG SIGNALS:"
     )
 
-    if bearish_symbols:
+    for coin in strong_coins[:20]:
+
         lines.append(
-            "• " +
-            " • ".join(bearish_symbols)
+            f"• {coin}"
         )
-    else:
-        lines.append("• None")
 
-    # -----------------------------------------------------
-    # Strong signals
-    # -----------------------------------------------------
+    if len(strong_coins) > 20:
 
-    if strong_coins:
+        lines.append(
+            f"• +"
+            f"{len(strong_coins) - 20}"
+            f" more"
+        )
 
-        lines.append("")
-        lines.append("🔥 STRONG SIGNALS:")
-
-        for coin in strong_coins[:20]:
-            lines.append(
-                f"• {coin}"
-            )
-
-        if len(strong_coins) > 20:
-            lines.append(
-                f"• +{len(strong_coins) - 20} more"
-            )
-
-    send_telegram(
-        "\n".join(lines)
-    )
-
+send_telegram(
+    "\n".join(lines)
+)
+```
 
 # =========================================================
+
 # SCAN
+
 # =========================================================
 
 def scan(interval):
 
-    print("")
-    print("=" * 60)
+```
+print("")
+
+print("=" * 60)
+
+print(
+    f"🚀 Starting Binance EMA Scanner: "
+    f"{interval.upper()}"
+)
+
+print("=" * 60)
+
+print(
+    "📚 EMA calculation mode: "
+    "FULL HISTORICAL CANDLES"
+)
+
+print(
+    "🔒 Signal mode: "
+    "CLOSED CANDLES ONLY"
+)
+
+if TEST_MODE:
+
     print(
-        f"🚀 Starting Binance EMA Scanner: "
-        f"{interval.upper()}"
+        "🧪 TEST MODE ENABLED"
     )
-    print("=" * 60)
 
-    if TEST_MODE:
-        print(
-            "🧪 TEST MODE ENABLED"
-        )
-        print(
-            "Duplicate protection is bypassed "
-            "for this manual run."
-        )
+    print(
+        "Duplicate protection is bypassed "
+        "for this manual run."
+    )
 
-    state = load_state()
+state = load_state()
 
-    alerts = state.get(
-        "alerts",
+alerts = state.get(
+    "alerts",
+    []
+)
+
+alerted_symbols = set(
+    state.get(
+        "alerted_symbols",
         []
     )
+)
 
-    alerted_symbols = set(
-        state.get(
-            "alerted_symbols",
-            []
-        )
-    )
+symbols = get_usdt_pairs()
 
-    symbols = get_usdt_pairs()
+print(
+    f"📊 USDT Spot pairs found: "
+    f"{len(symbols)}"
+)
+
+if not symbols:
 
     print(
-        f"📊 USDT Spot pairs found: "
-        f"{len(symbols)}"
+        "❌ No Binance USDT pairs found."
     )
 
-    if not symbols:
-        print(
-            "❌ No Binance USDT pairs found."
-        )
-        return
+    return
 
-    results = []
+results = []
 
-    # -----------------------------------------------------
-    # Parallel scan
-    # -----------------------------------------------------
+# =====================================================
+# PARALLEL SCAN
+# =====================================================
 
-    with ThreadPoolExecutor(
-        max_workers=MAX_WORKERS
-    ) as executor:
+with ThreadPoolExecutor(
+    max_workers=MAX_WORKERS
+) as executor:
 
-        futures = {
-            executor.submit(
-                analyze_symbol,
-                symbol,
-                interval
-            ): symbol
-            for symbol in symbols
-        }
+    futures = {
+        executor.submit(
+            analyze_symbol,
+            symbol,
+            interval
+        ): symbol
+        for symbol in symbols
+    }
 
-        for future in as_completed(futures):
+    for future in as_completed(
+        futures
+    ):
 
-            symbol = futures[future]
+        symbol = futures[future]
 
-            try:
-                result = future.result()
+        try:
 
-                if result:
-                    results.append(result)
+            result = future.result()
 
-            except Exception as e:
-                print(
-                    f"❌ Error scanning "
-                    f"{symbol}: {e}"
+            if result:
+
+                results.append(
+                    result
                 )
 
-    results.sort(
-        key=lambda x: x["symbol"]
+        except Exception as e:
+
+            print(
+                f"❌ Error scanning "
+                f"{symbol}: {e}"
+            )
+
+results.sort(
+    key=lambda x: x["symbol"]
+)
+
+print(
+    f"📢 Signals found: "
+    f"{len(results)}"
+)
+
+# =====================================================
+# NEW ALERT SYMBOLS
+# =====================================================
+
+new_alert_symbols = []
+
+# =====================================================
+# PROCESS ALERTS
+# =====================================================
+
+for result in results:
+
+    signal_id = make_signal_id(
+        result
     )
+
+    # -------------------------------------------------
+    # Duplicate protection
+    # -------------------------------------------------
+
+    if (
+        signal_id in alerts
+        and not TEST_MODE
+    ):
+
+        continue
+
+    previously_alerted = (
+        result["symbol"]
+        in alerted_symbols
+    )
+
+    # -------------------------------------------------
+    # MTF
+    # -------------------------------------------------
+
+    mtf = get_mtf_confirmation(
+        result["symbol"],
+        interval
+    )
+
+    # -------------------------------------------------
+    # Message
+    # -------------------------------------------------
+
+    message = format_message(
+        result,
+        previously_alerted,
+        mtf
+    )
+
+    print("")
 
     print(
-        f"📢 Signals found: "
-        f"{len(results)}"
+        f"📤 Sending alert: "
+        f"{result['symbol']}"
     )
 
-    # -----------------------------------------------------
-    # NEW:
-    # Store actual symbols whose alerts were sent
-    # -----------------------------------------------------
+    sent = send_telegram(
+        message
+    )
 
-    new_alert_symbols = []
+    if sent:
 
-    # -----------------------------------------------------
-    # Process alerts
-    # -----------------------------------------------------
-
-    for result in results:
-
-        signal_id = make_signal_id(
-            result
-        )
-
-        # Normal mode:
-        # exact same signal will not repeat
-        #
-        # Test mode:
-        # same signal can be sent again
-
-        if (
-            signal_id in alerts
-            and not TEST_MODE
-        ):
-            continue
-
-        previously_alerted = (
+        new_alert_symbols.append(
             result["symbol"]
-            in alerted_symbols
         )
 
-        mtf = get_mtf_confirmation(
-            result["symbol"],
-            interval
+        if signal_id not in alerts:
+
+            alerts.append(
+                signal_id
+            )
+
+        alerted_symbols.add(
+            result["symbol"]
         )
 
-        message = format_message(
-            result,
-            previously_alerted,
-            mtf
-        )
-
-        print("")
         print(
-            f"📤 Sending alert: "
+            f"✅ Alert sent: "
             f"{result['symbol']}"
         )
 
-        sent = send_telegram(
-            message
+    else:
+
+        print(
+            f"❌ Alert failed: "
+            f"{result['symbol']}"
         )
 
-        if sent:
+# =====================================================
+# SUMMARY
+# =====================================================
 
-            # ---------------------------------------------
-            # NEW:
-            # Store actual successfully sent symbol
-            # ---------------------------------------------
+if results:
 
-            new_alert_symbols.append(
-                result["symbol"]
-            )
-
-            # Keep state updated
-            if signal_id not in alerts:
-                alerts.append(
-                    signal_id
-                )
-
-            alerted_symbols.add(
-                result["symbol"]
-            )
-
-            print(
-                f"✅ Alert sent: "
-                f"{result['symbol']}"
-            )
-
-        else:
-            print(
-                f"❌ Alert failed: "
-                f"{result['symbol']}"
-            )
-
-    # -----------------------------------------------------
-    # Summary
-    # -----------------------------------------------------
-
-    if results:
-        send_summary(
-            results,
-            interval,
-            new_alert_symbols
-        )
-
-    # -----------------------------------------------------
-    # Save state
-    # -----------------------------------------------------
-
-    state["alerts"] = alerts
-
-    state["alerted_symbols"] = sorted(
-        alerted_symbols
+    send_summary(
+        results,
+        interval,
+        new_alert_symbols
     )
 
-    save_state(state)
+# =====================================================
+# SAVE STATE
+# =====================================================
 
-    print("")
-    print("=" * 60)
-    print(
-        f"✅ Scan completed: "
-        f"{interval.upper()}"
-    )
-    print(
-        f"📨 New alerts sent: "
-        f"{len(new_alert_symbols)}"
-    )
-    print("=" * 60)
+state["alerts"] = alerts
 
+state["alerted_symbols"] = sorted(
+    alerted_symbols
+)
+
+save_state(
+    state
+)
+
+print("")
+
+print("=" * 60)
+
+print(
+    f"✅ Scan completed: "
+    f"{interval.upper()}"
+)
+
+print(
+    f"📨 New alerts sent: "
+    f"{len(new_alert_symbols)}"
+)
+
+print("=" * 60)
+```
 
 # =========================================================
+
 # MAIN
+
 # =========================================================
 
-if __name__ == "__main__":
+if **name** == "**main**":
 
-    if len(sys.argv) != 2:
-        print(
-            "Usage: python scanner.py 4h"
-        )
-        print(
-            "   or: python scanner.py 1d"
-        )
-        sys.exit(1)
+```
+if len(sys.argv) != 2:
 
-    timeframe = sys.argv[1].lower()
+    print(
+        "Usage: python scanner.py 4h"
+    )
 
-    if timeframe not in ["4h", "1d"]:
-        print(
-            "❌ Invalid timeframe."
-        )
-        print(
-            "Use 4h or 1d."
-        )
-        sys.exit(1)
+    print(
+        "   or: python scanner.py 1d"
+    )
 
-    scan(timeframe)
+    sys.exit(1)
+
+timeframe = (
+    sys.argv[1].lower()
+)
+
+if timeframe not in [
+    "4h",
+    "1d"
+]:
+
+    print(
+        "❌ Invalid timeframe."
+    )
+
+    print(
+        "Use 4h or 1d."
+    )
+
+    sys.exit(1)
+
+scan(
+    timeframe
+)
