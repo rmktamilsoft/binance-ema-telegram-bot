@@ -4,6 +4,7 @@ import json
 import time
 import requests
 import pandas as pd
+from html import escape
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -30,6 +31,7 @@ KLINE_PAGE_SLEEP = 0.05
 IST = ZoneInfo("Asia/Kolkata")
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+
 TELEGRAM_CHAT_IDS = os.environ.get(
 "TELEGRAM_CHAT_IDS",
 ""
@@ -42,7 +44,10 @@ TELEGRAM_CHAT_IDS = os.environ.get(
 # false = normal duplicate protection
 
 TEST_MODE = (
-os.environ.get("TEST_MODE", "false").lower() == "true"
+os.environ.get(
+"TEST_MODE",
+"false"
+).lower() == "true"
 )
 
 # =========================================================
@@ -55,9 +60,11 @@ def load_state():
 
 ```
 if not os.path.exists(STATE_FILE):
+
     return {
         "alerts": [],
-        "alerted_symbols": []
+        "alerted_symbols": [],
+        "alert_message_links": {}
     }
 
 try:
@@ -70,11 +77,17 @@ try:
 
         state = json.load(f)
 
-    # Backward compatibility if old state was just a list
+    # -------------------------------------------------
+    # Backward compatibility:
+    # Old state.json may have been only a list.
+    # -------------------------------------------------
+
     if isinstance(state, list):
+
         return {
             "alerts": state,
-            "alerted_symbols": []
+            "alerted_symbols": [],
+            "alert_message_links": {}
         }
 
     return {
@@ -85,6 +98,10 @@ try:
         "alerted_symbols": state.get(
             "alerted_symbols",
             []
+        ),
+        "alert_message_links": state.get(
+            "alert_message_links",
+            {}
         )
     }
 
@@ -92,7 +109,8 @@ except Exception:
 
     return {
         "alerts": [],
-        "alerted_symbols": []
+        "alerted_symbols": [],
+        "alert_message_links": {}
     }
 ```
 
@@ -118,7 +136,10 @@ with open(
 
 # =========================================================
 
-def binance_get(url, params=None):
+def binance_get(
+url,
+params=None
+):
 
 ```
 for attempt in range(3):
@@ -196,7 +217,10 @@ return sorted(symbols)
 
 # =========================================================
 
-def get_klines(symbol, interval):
+def get_klines(
+symbol,
+interval
+):
 
 ```
 """
@@ -219,10 +243,6 @@ all_klines = []
 
 # -----------------------------------------------------
 # Start from the beginning of Binance history.
-#
-# Binance accepts startTime in milliseconds.
-# 0 means Unix epoch and lets Binance return the
-# earliest available candle for the symbol.
 # -----------------------------------------------------
 
 start_time = 0
@@ -249,18 +269,14 @@ while True:
     )
 
     # -------------------------------------------------
-    # If fewer than 1000 candles were returned,
-    # we reached the end of available history.
+    # Fewer than 1000 = reached the end.
     # -------------------------------------------------
 
     if len(klines) < BINANCE_KLINE_PAGE_SIZE:
         break
 
     # -------------------------------------------------
-    # Continue after the last candle returned.
-    #
-    # Open time is used because it is unique per
-    # symbol + interval.
+    # Continue after last returned candle.
     # -------------------------------------------------
 
     last_open_time = klines[-1][0]
@@ -269,13 +285,14 @@ while True:
         last_open_time + 1
     )
 
-    # Safety check against an unexpected API loop
+    # Safety check
     if next_start_time <= start_time:
         break
 
     start_time = next_start_time
 
     if KLINE_PAGE_SLEEP > 0:
+
         time.sleep(
             KLINE_PAGE_SLEEP
         )
@@ -285,9 +302,6 @@ if not all_klines:
 
 # -----------------------------------------------------
 # Remove duplicate candles.
-#
-# Binance pagination should not normally duplicate,
-# but this protects the EMA calculation.
 # -----------------------------------------------------
 
 unique = {}
@@ -313,16 +327,308 @@ return all_klines
 
 # =========================================================
 
-# TELEGRAM
+# TELEGRAM HELPERS
 
 # =========================================================
 
-def send_telegram(message):
+def get_telegram_chat_type(
+chat_id
+):
 
 ```
+"""
+Ask Telegram what type of chat this is.
+
+Returns:
+    private
+    group
+    supergroup
+    channel
+    None
+"""
+
+if not TELEGRAM_TOKEN:
+    return None
+
+url = (
+    f"https://api.telegram.org/bot"
+    f"{TELEGRAM_TOKEN}/getChat"
+)
+
+try:
+
+    response = requests.get(
+        url,
+        params={
+            "chat_id": chat_id
+        },
+        timeout=20
+    )
+
+    if not response.ok:
+
+        print(
+            f"⚠️ Could not get Telegram chat type "
+            f"for {chat_id}: "
+            f"{response.text}"
+        )
+
+        return None
+
+    data = response.json()
+
+    if not data.get("ok"):
+        return None
+
+    return (
+        data.get("result", {})
+        .get("type")
+    )
+
+except Exception as e:
+
+    print(
+        f"⚠️ Telegram getChat failed "
+        f"for {chat_id}: {e}"
+    )
+
+    return None
+```
+
+def build_telegram_message_link(
+chat_id,
+message_id,
+chat_type=None
+):
+
+```
+"""
+Build a direct Telegram message link.
+
+Supported direct-link case:
+    supergroup
+
+For private chats there is no universal public
+message URL that can be generated from chat_id +
+message_id.
+
+For normal groups/channels we also avoid creating
+potentially invalid links.
+"""
+
+if not message_id:
+    return None
+
+if chat_type == "supergroup":
+
+    try:
+
+        numeric_chat_id = int(
+            str(chat_id)
+        )
+
+        # Telegram supergroup IDs are normally:
+        # -100xxxxxxxxxx
+        #
+        # Remove the -100 prefix.
+        if str(numeric_chat_id).startswith(
+            "-100"
+        ):
+
+            internal_id = str(
+                numeric_chat_id
+            )[4:]
+
+            return (
+                "https://t.me/c/"
+                f"{internal_id}/"
+                f"{message_id}"
+            )
+
+    except Exception:
+        pass
+
+return None
+```
+
+def send_telegram_to_chat(
+message,
+chat_id
+):
+
+```
+"""
+Send one message to one Telegram chat.
+
+Returns:
+    {
+        "success": bool,
+        "chat_id": str,
+        "message_id": int or None,
+        "chat_type": str or None,
+        "message_link": str or None
+    }
+"""
+
+result = {
+    "success": False,
+    "chat_id": str(chat_id),
+    "message_id": None,
+    "chat_type": None,
+    "message_link": None
+}
+
+if not TELEGRAM_TOKEN:
+
+    print(
+        "❌ Telegram token missing."
+    )
+
+    return result
+
+chat_id = str(
+    chat_id
+).strip()
+
+if not chat_id:
+    return result
+
+url = (
+    f"https://api.telegram.org/bot"
+    f"{TELEGRAM_TOKEN}/sendMessage"
+)
+
+payload = {
+    "chat_id": chat_id,
+    "text": message,
+    "parse_mode": "HTML",
+    "disable_web_page_preview": True
+}
+
+try:
+
+    response = requests.post(
+        url,
+        json=payload,
+        timeout=20
+    )
+
+    if not response.ok:
+
+        print(
+            f"❌ Telegram error for {chat_id}:",
+            response.status_code,
+            response.text
+        )
+
+        return result
+
+    data = response.json()
+
+    if not data.get("ok"):
+
+        print(
+            f"❌ Telegram API error for {chat_id}:",
+            data
+        )
+
+        return result
+
+    message_data = data.get(
+        "result",
+        {}
+    )
+
+    message_id = message_data.get(
+        "message_id"
+    )
+
+    # -------------------------------------------------
+    # Telegram returned chat type.
+    # -------------------------------------------------
+
+    chat_data = message_data.get(
+        "chat",
+        {}
+    )
+
+    chat_type = chat_data.get(
+        "type"
+    )
+
+    # -------------------------------------------------
+    # Fallback: ask Telegram if needed.
+    # -------------------------------------------------
+
+    if not chat_type:
+
+        chat_type = get_telegram_chat_type(
+            chat_id
+        )
+
+    message_link = build_telegram_message_link(
+        chat_id,
+        message_id,
+        chat_type
+    )
+
+    result["success"] = True
+    result["message_id"] = message_id
+    result["chat_type"] = chat_type
+    result["message_link"] = message_link
+
+    print(
+        f"✅ Telegram sent to {chat_id}"
+    )
+
+    if message_link:
+
+        print(
+            f"🔗 Message link created: "
+            f"{message_link}"
+        )
+
+    elif chat_type == "private":
+
+        print(
+            f"ℹ️ Private chat {chat_id}: "
+            f"direct message link is not available"
+        )
+
+    return result
+
+except Exception as e:
+
+    print(
+        f"❌ Telegram request failed "
+        f"for {chat_id}: {e}"
+    )
+
+    return result
+```
+
+def send_telegram(
+message
+):
+
+```
+"""
+Send same message to all configured Telegram chats.
+
+Returns:
+    True only if every configured destination
+    successfully receives the message.
+"""
+
+chat_ids = [
+    chat_id.strip()
+    for chat_id in TELEGRAM_CHAT_IDS
+    if chat_id.strip()
+]
+
 if (
     not TELEGRAM_TOKEN
-    or not TELEGRAM_CHAT_IDS
+    or not chat_ids
 ):
 
     print(
@@ -331,58 +637,16 @@ if (
 
     return False
 
-url = (
-    f"https://api.telegram.org/bot"
-    f"{TELEGRAM_TOKEN}/sendMessage"
-)
-
 all_sent = True
 
-for chat_id in TELEGRAM_CHAT_IDS:
+for chat_id in chat_ids:
 
-    chat_id = chat_id.strip()
+    result = send_telegram_to_chat(
+        message,
+        chat_id
+    )
 
-    if not chat_id:
-        continue
-
-    payload = {
-        "chat_id": chat_id,
-        "text": message,
-        "disable_web_page_preview": True
-    }
-
-    try:
-
-        response = requests.post(
-            url,
-            json=payload,
-            timeout=20
-        )
-
-        if response.ok:
-
-            print(
-                f"✅ Telegram sent to {chat_id}"
-            )
-
-        else:
-
-            print(
-                f"❌ Telegram error for {chat_id}:",
-                response.status_code,
-                response.text
-            )
-
-            all_sent = False
-
-    except Exception as e:
-
-        print(
-            f"❌ Telegram request failed "
-            f"for {chat_id}:",
-            e
-        )
-
+    if not result["success"]:
         all_sent = False
 
 return all_sent
@@ -394,7 +658,9 @@ return all_sent
 
 # =========================================================
 
-def prepare_dataframe(klines):
+def prepare_dataframe(
+klines
+):
 
 ```
 if not klines:
@@ -472,14 +738,14 @@ df = df.sort_values(
 # -----------------------------------------------------
 
 df = df.drop_duplicates(
-    subset=["open_time"],
+    subset=[
+        "open_time"
+    ],
     keep="last"
 )
 
 # -----------------------------------------------------
-# Remove current forming candle
-#
-# Only CLOSED candles are allowed in EMA signal logic.
+# Remove current forming candle.
 # -----------------------------------------------------
 
 now = pd.Timestamp.now(
@@ -495,13 +761,6 @@ if len(df) < 205:
 
 # -----------------------------------------------------
 # FULL-HISTORY EMA
-#
-# IMPORTANT:
-# EMA is calculated only AFTER loading all historical
-# candles.
-#
-# This avoids calculating EMA200 from only the latest
-# 210 / 1000 / 1500 candles.
 # -----------------------------------------------------
 
 df["ema50"] = df["close"].ewm(
@@ -517,7 +776,7 @@ df["ema200"] = df["close"].ewm(
 ).mean()
 
 # -----------------------------------------------------
-# Remove rows where EMA is not ready
+# Remove rows where EMA is not ready.
 # -----------------------------------------------------
 
 df = df.dropna(
@@ -547,21 +806,25 @@ ema200
 
 ```
 if close > ema50 > ema200:
+
     return "STRONG BULLISH"
 
 if (
     close > ema50
     and ema50 <= ema200
 ):
+
     return "BULLISH / TRANSITION"
 
 if close < ema50 < ema200:
+
     return "STRONG BEARISH"
 
 if (
     close < ema50
     and ema50 >= ema200
 ):
+
     return "BEARISH / TRANSITION"
 
 return "NEUTRAL"
@@ -595,14 +858,7 @@ if df is None or len(df) < 2:
     return None
 
 # -----------------------------------------------------
-# IMPORTANT:
-#
-# df contains CLOSED candles only.
-#
-# previous = previous CLOSED candle
-# current  = latest CLOSED candle
-#
-# This prevents forming-candle signals.
+# CLOSED CANDLES ONLY
 # -----------------------------------------------------
 
 previous = df.iloc[-2]
@@ -695,11 +951,7 @@ if interval == "1d":
 # =====================================================
 # PRICE CROSSES ABOVE EMA 200
 #
-# STRICT CROSS:
-#
-# Previous CLOSED candle must be at/below EMA200
-# AND
-# Latest CLOSED candle must be above EMA200.
+# STRICT CLOSED-CANDLE CROSS
 # =====================================================
 
 if (
@@ -758,13 +1010,16 @@ return {
 
 # =========================================================
 
-def get_signal_strength(result):
+def get_signal_strength(
+result
+):
 
 ```
 signals = result["signals"]
 trend = result["trend"]
 
 if len(signals) >= 2:
+
     return "🔥 STRONG SIGNAL"
 
 if (
@@ -784,9 +1039,11 @@ if (
     return "🔥 STRONG SIGNAL"
 
 if "BULLISH" in trend:
+
     return "🟢 BULLISH SIGNAL"
 
 if "BEARISH" in trend:
+
     return "🔴 BEARISH SIGNAL"
 
 return "⚠️ SIGNAL"
@@ -798,7 +1055,9 @@ return "⚠️ SIGNAL"
 
 # =========================================================
 
-def format_times(timestamp):
+def format_times(
+timestamp
+):
 
 ```
 if timestamp.tzinfo is None:
@@ -831,7 +1090,9 @@ return (
 
 # =========================================================
 
-def make_signal_id(result):
+def make_signal_id(
+result
+):
 
 ```
 candle_time = (
@@ -954,8 +1215,11 @@ distance_200 = (
 ) * 100
 
 if interval == "4h":
+
     timeframe_text = "4H"
+
 else:
+
     timeframe_text = "1D"
 
 lines = []
@@ -1101,13 +1365,121 @@ lines.append(
 
 lines.append("")
 
-lines.append(
-    "🔗 Binance Chart: "
-    f"https://www.binance.com/en/trade/"
+# -----------------------------------------------------
+# Telegram HTML link
+# -----------------------------------------------------
+
+chart_url = (
+    "https://www.binance.com/en/trade/"
     f"{symbol}?type=spot"
 )
 
+lines.append(
+    f'🔗 Binance Chart: '
+    f'<a href="{chart_url}">Open Chart</a>'
+)
+
 return "\n".join(lines)
+```
+
+# =========================================================
+
+# SUMMARY HELPERS
+
+# =========================================================
+
+def make_summary_pair_text(
+symbols,
+chat_id,
+message_links
+):
+
+```
+"""
+Create summary pair list.
+
+For supergroup:
+    Pair name becomes clickable and points to
+    the original alert message.
+
+For private chat:
+    Pair name remains plain text because Telegram
+    does not provide a universal direct-message URL.
+
+message_links format:
+
+    {
+        signal_id: {
+            chat_id: "https://t.me/c/..."
+        }
+    }
+"""
+
+if not symbols:
+    return "• None"
+
+output = []
+
+for symbol in symbols:
+
+    signal_ids = []
+
+    # -------------------------------------------------
+    # Find signal IDs belonging to this symbol.
+    # -------------------------------------------------
+
+    for signal_id in message_links:
+
+        if signal_id.startswith(
+            f"{symbol}|"
+        ):
+
+            signal_ids.append(
+                signal_id
+            )
+
+    link = None
+
+    # -------------------------------------------------
+    # Find the first available message link for this
+    # symbol in the current destination.
+    # -------------------------------------------------
+
+    for signal_id in signal_ids:
+
+        chat_links = message_links.get(
+            signal_id,
+            {}
+        )
+
+        link = chat_links.get(
+            str(chat_id)
+        )
+
+        if link:
+            break
+
+    # -------------------------------------------------
+    # Clickable pair for group/supergroup.
+    # -------------------------------------------------
+
+    if link:
+
+        output.append(
+            f'<a href="{escape(link)}">'
+            f'{escape(symbol)}'
+            f'</a>'
+        )
+
+    else:
+
+        output.append(
+            escape(symbol)
+        )
+
+return "• " + " • ".join(
+    output
+)
 ```
 
 # =========================================================
@@ -1116,16 +1488,15 @@ return "\n".join(lines)
 
 # =========================================================
 
-def send_summary(
+def build_summary_message(
 results,
 interval,
-new_alert_symbols
+new_alert_symbols,
+chat_id,
+message_links
 ):
 
 ```
-if not results:
-    return
-
 timeframe = (
     "4H"
     if interval == "4h"
@@ -1172,7 +1543,9 @@ for result in results:
 
     if (
         "STRONG"
-        in get_signal_strength(result)
+        in get_signal_strength(
+            result
+        )
     ):
 
         strong_coins.append(
@@ -1213,9 +1586,9 @@ lines.append(
     f"📋 BINANCE {timeframe} SCAN SUMMARY"
 )
 
-# -----------------------------------------------------
+# =====================================================
 # Total
-# -----------------------------------------------------
+# =====================================================
 
 lines.append("")
 
@@ -1224,9 +1597,9 @@ lines.append(
     f"{len(results)}"
 )
 
-# -----------------------------------------------------
+# =====================================================
 # New alerts
-# -----------------------------------------------------
+# =====================================================
 
 lines.append("")
 
@@ -1235,24 +1608,17 @@ lines.append(
     f"{len(new_alert_symbols)}"
 )
 
-if new_alert_symbols:
-
-    lines.append(
-        "• "
-        + " • ".join(
-            new_alert_symbols
-        )
+lines.append(
+    make_summary_pair_text(
+        new_alert_symbols,
+        chat_id,
+        message_links
     )
+)
 
-else:
-
-    lines.append(
-        "• None"
-    )
-
-# -----------------------------------------------------
+# =====================================================
 # Bullish
-# -----------------------------------------------------
+# =====================================================
 
 lines.append("")
 
@@ -1261,24 +1627,17 @@ lines.append(
     f"{len(bullish_symbols)}"
 )
 
-if bullish_symbols:
-
-    lines.append(
-        "• "
-        + " • ".join(
-            bullish_symbols
-        )
+lines.append(
+    make_summary_pair_text(
+        bullish_symbols,
+        chat_id,
+        message_links
     )
+)
 
-else:
-
-    lines.append(
-        "• None"
-    )
-
-# -----------------------------------------------------
+# =====================================================
 # Bearish
-# -----------------------------------------------------
+# =====================================================
 
 lines.append("")
 
@@ -1287,24 +1646,17 @@ lines.append(
     f"{len(bearish_symbols)}"
 )
 
-if bearish_symbols:
-
-    lines.append(
-        "• "
-        + " • ".join(
-            bearish_symbols
-        )
+lines.append(
+    make_summary_pair_text(
+        bearish_symbols,
+        chat_id,
+        message_links
     )
+)
 
-else:
-
-    lines.append(
-        "• None"
-    )
-
-# -----------------------------------------------------
+# =====================================================
 # Strong signals
-# -----------------------------------------------------
+# =====================================================
 
 if strong_coins:
 
@@ -1317,7 +1669,11 @@ if strong_coins:
     for coin in strong_coins[:20]:
 
         lines.append(
-            f"• {coin}"
+            make_summary_pair_text(
+                [coin],
+                chat_id,
+                message_links
+            )
         )
 
     if len(strong_coins) > 20:
@@ -1328,9 +1684,70 @@ if strong_coins:
             f" more"
         )
 
-send_telegram(
-    "\n".join(lines)
+return "\n".join(
+    lines
 )
+```
+
+def send_summary(
+results,
+interval,
+new_alert_symbols,
+message_links
+):
+
+```
+if not results:
+    return
+
+chat_ids = [
+    chat_id.strip()
+    for chat_id in TELEGRAM_CHAT_IDS
+    if chat_id.strip()
+]
+
+if not chat_ids:
+    return
+
+# -----------------------------------------------------
+# Send a separate summary to each destination.
+#
+# This is important because a group has a different
+# message link from a personal chat.
+# -----------------------------------------------------
+
+for chat_id in chat_ids:
+
+    summary = build_summary_message(
+        results,
+        interval,
+        new_alert_symbols,
+        chat_id,
+        message_links
+    )
+
+    print("")
+
+    print(
+        f"📋 Sending summary to {chat_id}"
+    )
+
+    result = send_telegram_to_chat(
+        summary,
+        chat_id
+    )
+
+    if result["success"]:
+
+        print(
+            f"✅ Summary sent to {chat_id}"
+        )
+
+    else:
+
+        print(
+            f"❌ Summary failed for {chat_id}"
+        )
 ```
 
 # =========================================================
@@ -1339,7 +1756,9 @@ send_telegram(
 
 # =========================================================
 
-def scan(interval):
+def scan(
+interval
+):
 
 ```
 print("")
@@ -1387,6 +1806,29 @@ alerted_symbols = set(
         []
     )
 )
+
+# -----------------------------------------------------
+# New:
+# Stores Telegram message links.
+#
+# {
+#   signal_id: {
+#       chat_id: message_link
+#   }
+# }
+# -----------------------------------------------------
+
+message_links = state.get(
+    "alert_message_links",
+    {}
+)
+
+if not isinstance(
+    message_links,
+    dict
+):
+
+    message_links = {}
 
 symbols = get_usdt_pairs()
 
@@ -1512,11 +1954,70 @@ for result in results:
         f"{result['symbol']}"
     )
 
-    sent = send_telegram(
-        message
-    )
+    # -------------------------------------------------
+    # Send individually to each configured chat.
+    #
+    # We need the returned message_id so that the
+    # summary can link back to this exact alert.
+    # -------------------------------------------------
 
-    if sent:
+    chat_ids = [
+        chat_id.strip()
+        for chat_id in TELEGRAM_CHAT_IDS
+        if chat_id.strip()
+    ]
+
+    all_sent = True
+    successful_destinations = []
+
+    for chat_id in chat_ids:
+
+        telegram_result = (
+            send_telegram_to_chat(
+                message,
+                chat_id
+            )
+        )
+
+        if telegram_result["success"]:
+
+            successful_destinations.append(
+                chat_id
+            )
+
+            # -------------------------------------------------
+            # Save direct message link if Telegram supports it.
+            # -------------------------------------------------
+
+            if telegram_result["message_link"]:
+
+                if signal_id not in message_links:
+
+                    message_links[
+                        signal_id
+                    ] = {}
+
+                message_links[
+                    signal_id
+                ][chat_id] = (
+                    telegram_result[
+                        "message_link"
+                    ]
+                )
+
+        else:
+
+            all_sent = False
+
+    # -------------------------------------------------
+    # Consider alert successfully sent only when every
+    # configured destination received it.
+    # -------------------------------------------------
+
+    if (
+        all_sent
+        and chat_ids
+    ):
 
         new_alert_symbols.append(
             result["symbol"]
@@ -1553,7 +2054,8 @@ if results:
     send_summary(
         results,
         interval,
-        new_alert_symbols
+        new_alert_symbols,
+        message_links
     )
 
 # =====================================================
@@ -1564,6 +2066,10 @@ state["alerts"] = alerts
 
 state["alerted_symbols"] = sorted(
     alerted_symbols
+)
+
+state["alert_message_links"] = (
+    message_links
 )
 
 save_state(
