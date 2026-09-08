@@ -27,14 +27,47 @@ KLINE_PAGE_SLEEP = 0.05
 
 IST = ZoneInfo("Asia/Kolkata")
 
+
+# =========================================================
+# TELEGRAM CONFIG
+# =========================================================
+
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 
-TELEGRAM_CHAT_IDS = os.environ.get(
-    "TELEGRAM_CHAT_IDS",
-    ""
-).split(",")
+TELEGRAM_CHAT_IDS = [
+    chat_id.strip()
+    for chat_id in os.environ.get(
+        "TELEGRAM_CHAT_IDS",
+        ""
+    ).split(",")
+    if chat_id.strip()
+]
 
-# Manual test mode:
+# Safe delay between messages to the SAME Telegram chat.
+#
+# Telegram groups have flood limits.
+# 3.2 seconds means roughly <= 19 messages/minute
+# to the same destination.
+TELEGRAM_MIN_INTERVAL = 3.2
+
+# Maximum number of attempts after Telegram errors.
+TELEGRAM_MAX_RETRIES = 3
+
+
+# Telegram send lock.
+#
+# This guarantees that two parts of the program
+# don't send Telegram messages at exactly the same time.
+telegram_lock = __import__("threading").Lock()
+
+# Last send time per Telegram chat.
+telegram_last_send = {}
+
+
+# =========================================================
+# TEST MODE
+# =========================================================
+
 # true  = resend already-alerted signals
 # false = normal duplicate protection
 
@@ -301,6 +334,49 @@ def get_klines(
 # TELEGRAM HELPERS
 # =========================================================
 
+def wait_for_telegram_slot(chat_id):
+
+    """
+    Wait until this Telegram destination is safe to receive
+    another message.
+
+    This is per-chat, so multiple destinations can still
+    operate independently.
+    """
+
+    chat_id = str(chat_id)
+
+    with telegram_lock:
+
+        now = time.monotonic()
+
+        last_time = telegram_last_send.get(
+            chat_id,
+            0
+        )
+
+        wait_time = (
+            TELEGRAM_MIN_INTERVAL
+            - (now - last_time)
+        )
+
+        if wait_time > 0:
+
+            print(
+                f"⏳ Telegram delay for "
+                f"{chat_id}: "
+                f"{wait_time:.1f}s"
+            )
+
+            time.sleep(
+                wait_time
+            )
+
+        telegram_last_send[chat_id] = (
+            time.monotonic()
+        )
+
+
 def get_telegram_chat_type(
     chat_id
 ):
@@ -320,7 +396,7 @@ def get_telegram_chat_type(
         return None
 
     url = (
-        f"https://api.telegram.org/bot"
+        "https://api.telegram.org/bot"
         f"{TELEGRAM_TOKEN}/getChat"
     )
 
@@ -423,6 +499,8 @@ def send_telegram_to_chat(
     """
     Send one message to one Telegram chat.
 
+    Automatically handles Telegram 429 flood control.
+
     Returns:
         {
             "success": bool,
@@ -457,7 +535,7 @@ def send_telegram_to_chat(
         return result
 
     url = (
-        f"https://api.telegram.org/bot"
+        "https://api.telegram.org/bot"
         f"{TELEGRAM_TOKEN}/sendMessage"
     )
 
@@ -468,100 +546,205 @@ def send_telegram_to_chat(
         "disable_web_page_preview": True
     }
 
-    try:
+    for attempt in range(
+        TELEGRAM_MAX_RETRIES
+    ):
 
-        response = requests.post(
-            url,
-            json=payload,
-            timeout=20
+        # -------------------------------------------------
+        # SAFE SEND DELAY
+        # -------------------------------------------------
+
+        wait_for_telegram_slot(
+            chat_id
         )
 
-        if not response.ok:
+        try:
+
+            response = requests.post(
+                url,
+                json=payload,
+                timeout=30
+            )
+
+            # =================================================
+            # SUCCESS
+            # =================================================
+
+            if response.status_code == 200:
+
+                data = response.json()
+
+                if not data.get("ok"):
+
+                    print(
+                        f"❌ Telegram API error for "
+                        f"{chat_id}: "
+                        f"{data}"
+                    )
+
+                    return result
+
+                message_data = data.get(
+                    "result",
+                    {}
+                )
+
+                message_id = message_data.get(
+                    "message_id"
+                )
+
+                # Telegram normally returns chat type
+                chat_data = message_data.get(
+                    "chat",
+                    {}
+                )
+
+                chat_type = chat_data.get(
+                    "type"
+                )
+
+                # Fallback if needed
+                if not chat_type:
+
+                    chat_type = get_telegram_chat_type(
+                        chat_id
+                    )
+
+                message_link = (
+                    build_telegram_message_link(
+                        chat_id,
+                        message_id,
+                        chat_type
+                    )
+                )
+
+                result["success"] = True
+                result["message_id"] = message_id
+                result["chat_type"] = chat_type
+                result["message_link"] = message_link
+
+                print(
+                    f"✅ Telegram sent to "
+                    f"{chat_id}"
+                )
+
+                if message_link:
+
+                    print(
+                        f"🔗 Message link created: "
+                        f"{message_link}"
+                    )
+
+                elif chat_type == "private":
+
+                    print(
+                        f"ℹ️ Private chat {chat_id}: "
+                        f"direct message link is not available"
+                    )
+
+                return result
+
+            # =================================================
+            # TELEGRAM RATE LIMIT - 429
+            # =================================================
+
+            if response.status_code == 429:
+
+                try:
+                    data = response.json()
+                except Exception:
+                    data = {}
+
+                retry_after = int(
+                    data.get(
+                        "parameters",
+                        {}
+                    ).get(
+                        "retry_after",
+                        60
+                    )
+                )
+
+                print("")
+                print(
+                    f"⚠️ TELEGRAM RATE LIMIT "
+                    f"for {chat_id}"
+                )
+
+                print(
+                    f"⏳ Telegram says wait "
+                    f"{retry_after} seconds"
+                )
+
+                print(
+                    f"🔄 Retry attempt "
+                    f"{attempt + 1}/"
+                    f"{TELEGRAM_MAX_RETRIES}"
+                )
+
+                # Wait exactly as Telegram requests
+                # +1 second safety buffer.
+                time.sleep(
+                    retry_after + 1
+                )
+
+                continue
+
+            # =================================================
+            # OTHER HTTP ERROR
+            # =================================================
 
             print(
-                f"❌ Telegram error for {chat_id}:",
-                response.status_code,
-                response.text
+                f"❌ Telegram error for "
+                f"{chat_id}: "
+                f"{response.status_code} "
+                f"{response.text}"
             )
 
             return result
 
-        data = response.json()
-
-        if not data.get("ok"):
+        except requests.RequestException as e:
 
             print(
-                f"❌ Telegram API error for {chat_id}:",
-                data
+                f"❌ Telegram request failed "
+                f"for {chat_id}: {e}"
+            )
+
+            if attempt < TELEGRAM_MAX_RETRIES - 1:
+
+                retry_wait = 5 * (
+                    attempt + 1
+                )
+
+                print(
+                    f"⏳ Retrying in "
+                    f"{retry_wait}s..."
+                )
+
+                time.sleep(
+                    retry_wait
+                )
+
+                continue
+
+            return result
+
+        except Exception as e:
+
+            print(
+                f"❌ Unexpected Telegram error "
+                f"for {chat_id}: {e}"
             )
 
             return result
 
-        message_data = data.get(
-            "result",
-            {}
-        )
+    print(
+        f"❌ Telegram failed after "
+        f"{TELEGRAM_MAX_RETRIES} attempts "
+        f"→ {chat_id}"
+    )
 
-        message_id = message_data.get(
-            "message_id"
-        )
-
-        # Telegram returned chat type.
-        chat_data = message_data.get(
-            "chat",
-            {}
-        )
-
-        chat_type = chat_data.get(
-            "type"
-        )
-
-        # Fallback: ask Telegram if needed.
-        if not chat_type:
-
-            chat_type = get_telegram_chat_type(
-                chat_id
-            )
-
-        message_link = build_telegram_message_link(
-            chat_id,
-            message_id,
-            chat_type
-        )
-
-        result["success"] = True
-        result["message_id"] = message_id
-        result["chat_type"] = chat_type
-        result["message_link"] = message_link
-
-        print(
-            f"✅ Telegram sent to {chat_id}"
-        )
-
-        if message_link:
-
-            print(
-                f"🔗 Message link created: "
-                f"{message_link}"
-            )
-
-        elif chat_type == "private":
-
-            print(
-                f"ℹ️ Private chat {chat_id}: "
-                f"direct message link is not available"
-            )
-
-        return result
-
-    except Exception as e:
-
-        print(
-            f"❌ Telegram request failed "
-            f"for {chat_id}: {e}"
-        )
-
-        return result
+    return result
 
 
 def send_telegram(
@@ -603,6 +786,7 @@ def send_telegram(
         )
 
         if not result["success"]:
+
             all_sent = False
 
     return all_sent
@@ -1158,7 +1342,8 @@ def format_message(
     lines.append("")
 
     lines.append(
-        f"📊 Signal Strength: {escape(strength)}"
+        f"📊 Signal Strength: "
+        f"{escape(strength)}"
     )
 
     lines.append("")
@@ -1583,9 +1768,6 @@ def send_summary(
         return
 
     # Send separate summary to each destination.
-    #
-    # Group message links and private chat
-    # destinations are different.
 
     for chat_id in chat_ids:
 
@@ -1600,7 +1782,8 @@ def send_summary(
         print("")
 
         print(
-            f"📋 Sending summary to {chat_id}"
+            f"📋 Sending summary to "
+            f"{chat_id}"
         )
 
         result = send_telegram_to_chat(
@@ -1611,13 +1794,15 @@ def send_summary(
         if result["success"]:
 
             print(
-                f"✅ Summary sent to {chat_id}"
+                f"✅ Summary sent to "
+                f"{chat_id}"
             )
 
         else:
 
             print(
-                f"❌ Summary failed for {chat_id}"
+                f"❌ Summary failed for "
+                f"{chat_id}"
             )
 
 
@@ -1648,6 +1833,16 @@ def scan(
     print(
         "🔒 Signal mode: "
         "CLOSED CANDLES ONLY"
+    )
+
+    print(
+        f"📨 Telegram destinations: "
+        f"{len(TELEGRAM_CHAT_IDS)}"
+    )
+
+    print(
+        f"⏱ Telegram minimum interval: "
+        f"{TELEGRAM_MIN_INTERVAL}s"
     )
 
     if TEST_MODE:
@@ -1777,12 +1972,19 @@ def scan(
             result
         )
 
-        # Duplicate protection
+        # =================================================
+        # DUPLICATE PROTECTION
+        # =================================================
 
         if (
             signal_id in alerts
             and not TEST_MODE
         ):
+
+            print(
+                f"⏭ Duplicate skipped: "
+                f"{result['symbol']}"
+            )
 
             continue
 
@@ -1801,7 +2003,7 @@ def scan(
         )
 
         # =================================================
-        # Message
+        # MESSAGE
         # =================================================
 
         message = format_message(
