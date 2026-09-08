@@ -58,7 +58,7 @@ os.environ.get(
 
 def load_state():
 
-```
+
 if not os.path.exists(STATE_FILE):
 
     return {
@@ -112,11 +112,11 @@ except Exception:
         "alerted_symbols": [],
         "alert_message_links": {}
     }
-```
+
 
 def save_state(state):
 
-```
+
 with open(
     STATE_FILE,
     "w",
@@ -128,7 +128,7 @@ with open(
         f,
         indent=2
     )
-```
+
 
 # =========================================================
 
@@ -141,7 +141,7 @@ url,
 params=None
 ):
 
-```
+
 for attempt in range(3):
 
     try:
@@ -170,7 +170,7 @@ for attempt in range(3):
             )
 
 return None
-```
+
 
 # =========================================================
 
@@ -180,7 +180,7 @@ return None
 
 def get_usdt_pairs():
 
-```
+
 url = (
     "https://data-api.binance.vision/"
     "api/v3/exchangeInfo"
@@ -209,7 +209,7 @@ for item in data.get(
         )
 
 return sorted(symbols)
-```
+
 
 # =========================================================
 
@@ -222,7 +222,7 @@ symbol,
 interval
 ):
 
-```
+
 """
 Download ALL available Binance historical candles.
 
@@ -323,7 +323,7 @@ print(
 )
 
 return all_klines
-```
+
 
 # =========================================================
 
@@ -335,7 +335,7 @@ def get_telegram_chat_type(
 chat_id
 ):
 
-```
+
 """
 Ask Telegram what type of chat this is.
 
@@ -393,7 +393,7 @@ except Exception as e:
     )
 
     return None
-```
+
 
 def build_telegram_message_link(
 chat_id,
@@ -401,7 +401,7 @@ message_id,
 chat_type=None
 ):
 
-```
+
 """
 Build a direct Telegram message link.
 
@@ -449,14 +449,14 @@ if chat_type == "supergroup":
         pass
 
 return None
-```
+
 
 def send_telegram_to_chat(
 message,
 chat_id
 ):
 
-```
+
 """
 Send one message to one Telegram chat.
 
@@ -605,13 +605,13 @@ except Exception as e:
     )
 
     return result
-```
+
 
 def send_telegram(
 message
 ):
 
-```
+
 """
 Send same message to all configured Telegram chats.
 
@@ -650,7 +650,7 @@ for chat_id in chat_ids:
         all_sent = False
 
 return all_sent
-```
+
 
 # =========================================================
 
@@ -662,7 +662,7 @@ def prepare_dataframe(
 klines
 ):
 
-```
+
 if not klines:
     return None
 
@@ -790,7 +790,7 @@ if len(df) < 2:
     return None
 
 return df
-```
+
 
 # =========================================================
 
@@ -804,7 +804,7 @@ ema50,
 ema200
 ):
 
-```
+
 if close > ema50 > ema200:
 
     return "STRONG BULLISH"
@@ -828,7 +828,7 @@ if (
     return "BEARISH / TRANSITION"
 
 return "NEUTRAL"
-```
+
 
 # =========================================================
 
@@ -841,7 +841,7 @@ symbol,
 interval
 ):
 
-```
+
 klines = get_klines(
     symbol,
     interval
@@ -1002,7 +1002,7 @@ return {
     "ema200": ema200,
     "candle_time": current["close_time"]
 }
-```
+
 
 # =========================================================
 
@@ -1014,7 +1014,7 @@ def get_signal_strength(
 result
 ):
 
-```
+
 signals = result["signals"]
 trend = result["trend"]
 
@@ -1047,7 +1047,7 @@ if "BEARISH" in trend:
     return "🔴 BEARISH SIGNAL"
 
 return "⚠️ SIGNAL"
-```
+
 
 # =========================================================
 
@@ -1059,7 +1059,7 @@ def format_times(
 timestamp
 ):
 
-```
+
 if timestamp.tzinfo is None:
 
     timestamp = timestamp.replace(
@@ -1082,7 +1082,7 @@ return (
         "%Y-%m-%d %H:%M:%S IST"
     )
 )
-```
+
 
 # =========================================================
 
@@ -1094,7 +1094,7 @@ def make_signal_id(
 result
 ):
 
-```
+
 candle_time = (
     result["candle_time"].isoformat()
 )
@@ -1109,7 +1109,7 @@ return (
     f"{candle_time}|"
     f"{signal_text}"
 )
-```
+
 
 # =========================================================
 
@@ -1122,7 +1122,7 @@ symbol,
 current_interval
 ):
 
-```
+
 other_interval = (
     "1d"
     if current_interval == "4h"
@@ -1171,7 +1171,7 @@ return {
     "ema50": ema50,
     "ema200": ema200
 }
-```
+
 
 # =========================================================
 
@@ -1185,7 +1185,7 @@ previously_alerted=False,
 mtf=None
 ):
 
-```
+
 symbol = result["symbol"]
 interval = result["interval"]
 
@@ -1380,7 +1380,7 @@ lines.append(
 )
 
 return "\n".join(lines)
-```
+
 
 # =========================================================
 
@@ -1394,7 +1394,7 @@ chat_id,
 message_links
 ):
 
-```
+
 """
 Create summary pair list.
 
@@ -1480,7 +1480,7 @@ for symbol in symbols:
 return "• " + " • ".join(
     output
 )
-```
+
 
 # =========================================================
 
@@ -1496,7 +1496,7 @@ chat_id,
 message_links
 ):
 
-```
+
 timeframe = (
     "4H"
     if interval == "4h"
@@ -1687,7 +1687,7 @@ if strong_coins:
 return "\n".join(
     lines
 )
-```
+
 
 def send_summary(
 results,
@@ -1696,7 +1696,7 @@ new_alert_symbols,
 message_links
 ):
 
-```
+
 if not results:
     return
 
@@ -1748,7 +1748,7 @@ for chat_id in chat_ids:
         print(
             f"❌ Summary failed for {chat_id}"
         )
-```
+
 
 # =========================================================
 
@@ -1760,7 +1760,7 @@ def scan(
 interval
 ):
 
-```
+
 print("")
 
 print("=" * 60)
@@ -2091,7 +2091,7 @@ print(
 )
 
 print("=" * 60)
-```
+
 
 # =========================================================
 
@@ -2101,7 +2101,7 @@ print("=" * 60)
 
 if **name** == "**main**":
 
-```
+
 if len(sys.argv) != 2:
 
     print(
@@ -2136,3 +2136,4 @@ if timeframe not in [
 scan(
     timeframe
 )
+
